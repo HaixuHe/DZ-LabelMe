@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>人工 + AI 波段标注工具</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <div class="shell">
+        <aside class="sidebar">
+            <section class="brand-panel">
+                <p class="eyebrow">Geo Remote Sensing Label Studio</p>
+                <h1>人工 + AI 像素标注</h1>
+                <p class="brand-copy">三波段合成、2% 拉伸、像素级刷写、随机森林推理与迭代修正，全部在本地浏览器完成。</p>
+            </section>
+
+            <section class="panel">
+                <h2>数据选择</h2>
+                <label class="field">
+                    <span>自定义文件夹</span>
+                    <div class="inline-inputs">
+                        <input id="folderPathInput" type="text" placeholder="支持绝对路径或相对工作区路径">
+                        <button id="scanFolderBtn" class="ghost">扫描</button>
+                    </div>
+                </label>
+                <div class="band-grid">
+                    <label class="field">
+                        <span>红波段</span>
+                        <select id="redBandSelect"></select>
+                    </label>
+                    <label class="field">
+                        <span>绿波段</span>
+                        <select id="greenBandSelect"></select>
+                    </label>
+                    <label class="field">
+                        <span>蓝波段</span>
+                        <select id="blueBandSelect"></select>
+                    </label>
+                </div>
+                <button id="loadSceneBtn" class="primary wide">加载三波段合成</button>
+                <div id="sceneInfo" class="info-card muted">尚未选择场景。</div>
+            </section>
+
+            <section class="panel">
+                <div class="section-title-row">
+                    <h2>标注工具</h2>
+                    <div class="tool-toggle">
+                        <button id="brushToolBtn" class="active">画笔</button>
+                        <button id="eraserToolBtn">橡皮</button>
+                    </div>
+                </div>
+                <div id="classList" class="class-list"></div>
+                <div class="new-class-row">
+                    <input id="newClassName" type="text" maxlength="32" placeholder="新类别名称">
+                    <input id="newClassColor" type="color" value="#c77d20">
+                    <button id="addClassBtn" class="ghost">添加</button>
+                </div>
+                <label class="field">
+                    <span>笔刷半径 <strong id="brushSizeValue">6</strong> px</span>
+                    <input id="brushSizeInput" type="range" min="1" max="80" step="1" value="6">
+                </label>
+                <label class="field">
+                    <span>人工标注透明度 <strong id="labelOpacityValue">74%</strong></span>
+                    <input id="labelOpacityInput" type="range" min="5" max="100" step="1" value="74">
+                </label>
+                <div class="button-grid">
+                    <button id="clearLabelsBtn" class="ghost">清空可编辑层</button>
+                    <button id="copyPredictionBtn" class="ghost">复制 AI 到可编辑层</button>
+                </div>
+                <p class="hint">左键拖动连续涂抹。快捷键：B 画笔，E 橡皮，数字键切换前 9 个类别，方括号调整笔刷。</p>
+            </section>
+
+            <section class="panel">
+                <div class="section-title-row">
+                    <h2>AI 推理</h2>
+                </div>
+                <label class="field">
+                    <span>训练特征波段（Ctrl/Cmd+单击多选，留空则使用当前预览三波段）</span>
+                    <select id="trainBandsSelect" multiple size="6"></select>
+                </label>
+                <label class="field">
+                    <span>纹理特征邻域大小</span>
+                    <select id="neighborhoodSizeSelect">
+                        <option value="1">不加入纹理（1×1 单像素）</option>
+                        <option value="3" selected>3×3 邻域（均值 + 标准差）</option>
+                        <option value="5">5×5 邻域（均值 + 标准差）</option>
+                        <option value="7">7×7 邻域（均值 + 标准差）</option>
+                    </select>
+                </label>
+                <div class="train-grid">
+                    <label class="field">
+                        <span>树数量</span>
+                        <input id="nEstimatorsInput" type="number" min="10" max="500" step="10" value="120">
+                    </label>
+                    <label class="field">
+                        <span>最大深度</span>
+                        <input id="maxDepthInput" type="number" min="1" max="128" step="1" value="18">
+                    </label>
+                    <label class="field wide-field">
+                        <span>每类采样上限</span>
+                        <input id="maxSamplesInput" type="number" min="50" max="300000" step="50" value="15000">
+                    </label>
+                </div>
+                <button id="trainBtn" class="accent wide">训练随机森林并推理</button>
+                <div class="toggle-column">
+                    <label><input id="showPredictionInput" type="checkbox" checked> 显示 AI 结果</label>
+                    <label><input id="showLabelsInput" type="checkbox" checked> 显示人工标注</label>
+                </div>
+                <label class="field">
+                    <span>AI 结果透明度 <strong id="predictionOpacityValue">48%</strong></span>
+                    <input id="predictionOpacityInput" type="range" min="5" max="100" step="1" value="48">
+                </label>
+                <div class="button-grid">
+                    <button id="downloadLabelsBtn" class="ghost">导出当前标注</button>
+                    <button id="downloadPredictionBtn" class="ghost">导出 AI 结果</button>
+                </div>
+                <div id="trainStats" class="info-card muted">推理结果会显示在这里。</div>
+            </section>
+        </aside>
+
+        <main class="stage">
+            <div class="stage-toolbar">
+                <div class="zoom-cluster">
+                    <button id="fitViewBtn" class="ghost">适配视图</button>
+                    <button id="zoomOutBtn" class="ghost square">-</button>
+                    <input id="zoomSlider" type="range" min="5" max="300" step="1" value="100">
+                    <button id="zoomInBtn" class="ghost square">+</button>
+                    <span id="zoomLabel" class="zoom-label">100%</span>
+                </div>
+                <div class="status-cluster">
+                    <span id="statusPill" class="status-pill">未加载场景</span>
+                    <span id="cursorInfo" class="cursor-info">x -, y -, 标注 -, AI -</span>
+                </div>
+            </div>
+
+            <div class="workspace-card">
+                <p>工作区根目录</p>
+                <strong>{{ workspace_root }}</strong>
+            </div>
+
+            <div class="viewport-shell">
+                <div id="viewport" class="viewport">
+                    <div id="canvasStack" class="canvas-stack">
+                        <canvas id="imageCanvas"></canvas>
+                        <canvas id="overlayCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        window.APP_CONFIG = {
+            workspaceRoot: {{ workspace_root | tojson }}
+        };
+    </script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
