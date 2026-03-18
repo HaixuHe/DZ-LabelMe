@@ -68,7 +68,7 @@
                     <button id="clearLabelsBtn" class="ghost">清空可编辑层</button>
                     <button id="copyPredictionBtn" class="ghost">复制 AI 到可编辑层</button>
                 </div>
-                <p class="hint">左键拖动连续涂抹。快捷键：B 画笔，E 橡皮，数字键切换前 9 个类别，方括号调整笔刷。</p>
+                <p class="hint">左键拖动连续涂抒；空格 + 左键拖动平移图层。快捷键：B 画笔，E 橡皮，数字键切换前 9 个类别，方括号调整笔刷，+/- 调整缩放。滚轮以鼠标为中心缩放；鼠标中键拖动平移。</p>
             </section>
 
             <section class="panel">
@@ -103,6 +103,12 @@
                     </label>
                 </div>
                 <button id="trainBtn" class="accent wide">训练随机森林并推理</button>
+                <div id="inferProgressWrap" class="progress-wrap hidden">
+                    <div class="progress-bar-bg">
+                        <div id="inferProgressBar" class="progress-bar-fill" style="width:0%"></div>
+                    </div>
+                    <span id="inferProgressLabel" class="progress-label">准备中…</span>
+                </div>
                 <div class="toggle-column">
                     <label><input id="showPredictionInput" type="checkbox" checked> 显示 AI 结果</label>
                     <label><input id="showLabelsInput" type="checkbox" checked> 显示人工标注</label>
@@ -113,7 +119,7 @@
                 </label>
                 <div class="button-grid">
                     <button id="downloadLabelsBtn" class="ghost">导出当前标注</button>
-                    <button id="downloadPredictionBtn" class="ghost">导出 AI 结果</button>
+                    <button id="downloadPredictionBtn" class="ghost">导出 AI 结果 (TIF)</button>
                 </div>
                 <div id="trainStats" class="info-card muted">推理结果会显示在这里。</div>
             </section>
@@ -124,7 +130,7 @@
                 <div class="zoom-cluster">
                     <button id="fitViewBtn" class="ghost">适配视图</button>
                     <button id="zoomOutBtn" class="ghost square">-</button>
-                    <input id="zoomSlider" type="range" min="5" max="300" step="1" value="100">
+                    <input id="zoomSlider" type="range" min="5" max="1600" step="1" value="100">
                     <button id="zoomInBtn" class="ghost square">+</button>
                     <span id="zoomLabel" class="zoom-label">100%</span>
                 </div>

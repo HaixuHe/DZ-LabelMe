@@ -24,6 +24,9 @@ const elements = {
     maxDepthInput: document.getElementById("maxDepthInput"),
     maxSamplesInput: document.getElementById("maxSamplesInput"),
     trainBtn: document.getElementById("trainBtn"),
+    inferProgressWrap: document.getElementById("inferProgressWrap"),
+    inferProgressBar: document.getElementById("inferProgressBar"),
+    inferProgressLabel: document.getElementById("inferProgressLabel"),
     showPredictionInput: document.getElementById("showPredictionInput"),
     showLabelsInput: document.getElementById("showLabelsInput"),
     predictionOpacityInput: document.getElementById("predictionOpacityInput"),
@@ -79,8 +82,14 @@ const state = {
     zoom: 1,
     drawing: false,
     lastPoint: null,
-    isBusy: false
+    isBusy: false,
+    isInferring: false,
+    predictionTifUrl: null
 };
+
+// 平移状态：fromPointer=true 表示空格+左键（canvas capture），false 表示中键（window mouse）
+const panState = { active: false, fromPointer: false, startX: 0, startY: 0, scrollX: 0, scrollY: 0 };
+let spaceHeld = false;
 
 function buildBlankLookup() {
     return new Uint8ClampedArray(256 * 4);
@@ -134,6 +143,21 @@ function setBusy(busy, message) {
     if (message) {
         setStatus(message, busy ? "busy" : "");
     }
+}
+
+function setInferring(active) {
+    state.isInferring = active;
+    // 推理中隐藏/显示进度条
+    elements.inferProgressWrap.classList.toggle("hidden", !active);
+    if (!active) {
+        elements.inferProgressBar.style.width = "0%";
+        elements.inferProgressLabel.textContent = "";
+    }
+}
+
+function updateProgress(pct, message) {
+    elements.inferProgressBar.style.width = `${pct}%`;
+    elements.inferProgressLabel.textContent = message || "";
 }
 
 async function fetchJson(url, options = {}) {
@@ -265,7 +289,7 @@ function setZoom(zoomValue) {
     if (!state.imageWidth || !state.imageHeight) {
         return;
     }
-    state.zoom = Math.max(0.05, Math.min(3, zoomValue));
+    state.zoom = Math.max(0.05, Math.min(16, zoomValue));
     elements.zoomSlider.value = Math.round(state.zoom * 100);
     elements.zoomLabel.textContent = `${Math.round(state.zoom * 100)}%`;
     configureCanvasSize();
@@ -644,6 +668,9 @@ async function trainModel() {
     }
 
     setBusy(true, "正在训练随机森林并执行全图推理");
+    setInferring(true);
+    updateProgress(0, "准备中…");
+
     try {
         const formData = new FormData();
         formData.append("mask", await maskToBlob(state.labelMask), "labels.png");
@@ -660,22 +687,62 @@ async function trainModel() {
             method: "POST",
             body: formData
         });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
+
+        if (!response.ok || !response.body) {
+            const payload = await response.json().catch(() => ({}));
             throw new Error(payload.error || `训练失败：${response.status}`);
         }
 
-        state.predictionMask = await readMaskFromImage(payload.predictionUrl);
-        refreshColorLookup();
-        rebuildOverlay();
-        renderTrainStats(payload);
-        elements.copyPredictionBtn.disabled = false;
-        elements.downloadPredictionBtn.disabled = false;
-        setStatus(payload.message || "推理完成", "success");
+        // 用 SSE（text/event-stream）读取进度
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split("\n\n");
+            buffer = parts.pop(); // 保留不完整的最后一段
+
+            for (const block of parts) {
+                let eventType = "message";
+                let dataStr = "";
+                for (const line of block.split("\n")) {
+                    if (line.startsWith("event: ")) {
+                        eventType = line.slice(7).trim();
+                    } else if (line.startsWith("data: ")) {
+                        dataStr = line.slice(6).trim();
+                    }
+                }
+                if (!dataStr) continue;
+                let data;
+                try { data = JSON.parse(dataStr); } catch { continue; }
+
+                if (eventType === "progress") {
+                    updateProgress(data.pct ?? 0, data.message ?? "");
+                    if (data.pct != null) {
+                        setStatus(data.message || "推理中…", "busy");
+                    }
+                } else if (eventType === "result") {
+                    state.predictionMask = await readMaskFromImage(data.predictionUrl);
+                    state.predictionTifUrl = data.predictionTifUrl || null;
+                    refreshColorLookup();
+                    rebuildOverlay();
+                    renderTrainStats(data);
+                    elements.copyPredictionBtn.disabled = false;
+                    elements.downloadPredictionBtn.disabled = false;
+                    setStatus(data.message || "推理完成", "success");
+                } else if (eventType === "error") {
+                    throw new Error(data.message || "训练失败");
+                }
+            }
+        }
     } catch (error) {
         setStatus(error.message, "error");
     } finally {
         setBusy(false);
+        setInferring(false);
     }
 }
 
@@ -735,7 +802,13 @@ function addClass() {
 }
 
 function handlePointerDown(event) {
-    if (event.button !== 0 || !state.labelMask || state.isBusy) {
+    if (event.button !== 0 || !state.labelMask || state.isBusy || state.isInferring) {
+        return;
+    }
+    // 空格键按下时左键拖动为平移（fromPointer=true 表示由 canvas capture 驱动）
+    if (spaceHeld) {
+        beginPan(event.clientX, event.clientY, true);
+        elements.overlayCanvas.setPointerCapture?.(event.pointerId);
         return;
     }
     const point = eventToPixel(event);
@@ -750,6 +823,11 @@ function handlePointerDown(event) {
 }
 
 function handlePointerMove(event) {
+    // 空格+左键平移（pointer 已被 canvas capture）
+    if (panState.active && panState.fromPointer) {
+        continuePan(event.clientX, event.clientY);
+        return;
+    }
     const point = eventToPixel(event);
     if (!point) {
         updateCursorInfo(null, null);
@@ -764,6 +842,12 @@ function handlePointerMove(event) {
 }
 
 function handlePointerUp(event) {
+    // 空格平移结束
+    if (panState.active && panState.fromPointer) {
+        endPan();
+        elements.overlayCanvas.releasePointerCapture?.(event.pointerId);
+        return;
+    }
     if (!state.drawing) {
         return;
     }
@@ -794,6 +878,14 @@ function handleShortcuts(event) {
     if (event.key === "]") {
         elements.brushSizeInput.value = Math.min(80, Number(elements.brushSizeInput.value) + 1);
         syncBrushSize();
+        return;
+    }
+    if (event.key === "+" || event.key === "=") {
+        setZoom(state.zoom * 1.25);
+        return;
+    }
+    if (event.key === "-" || event.key === "_") {
+        setZoom(state.zoom / 1.25);
         return;
     }
     const numeric = Number.parseInt(event.key, 10);
@@ -831,6 +923,73 @@ function syncVisibility() {
     rebuildOverlay();
 }
 
+// ── 平移与缩放辅助函数 ────────────────────────────────────────
+
+function updateCanvasCursor() {
+    if (panState.active) {
+        elements.overlayCanvas.style.cursor = "grabbing";
+    } else if (spaceHeld && state.sessionId) {
+        elements.overlayCanvas.style.cursor = "grab";
+    } else {
+        elements.overlayCanvas.style.cursor = ""; // 回退到 CSS crosshair
+    }
+}
+
+function beginPan(clientX, clientY, fromPointer) {
+    panState.active = true;
+    panState.fromPointer = fromPointer;
+    panState.startX = clientX;
+    panState.startY = clientY;
+    panState.scrollX = elements.viewport.scrollLeft;
+    panState.scrollY = elements.viewport.scrollTop;
+    updateCanvasCursor();
+}
+
+function continuePan(clientX, clientY) {
+    if (!panState.active) {
+        return;
+    }
+    elements.viewport.scrollLeft = panState.scrollX - (clientX - panState.startX);
+    elements.viewport.scrollTop = panState.scrollY - (clientY - panState.startY);
+}
+
+function endPan() {
+    panState.active = false;
+    updateCanvasCursor();
+}
+
+/**
+ * 滚轮缩放：以鼠标所在图像像素为中心缩放，缩放后保持该像素不动。
+ * 原理：viewport 内 canvasStack 距内容原点始终为 padding=20px，
+ *   newScrollLeft = 20 + imgX * newZoom - cursorViewX
+ */
+function handleWheel(event) {
+    if (!state.sessionId) {
+        return;
+    }
+    event.preventDefault();
+    if (state.drawing) {
+        return;
+    }
+    const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const newZoom = Math.max(0.05, Math.min(16, state.zoom * factor));
+    if (Math.abs(newZoom - state.zoom) < 1e-9) {
+        return;
+    }
+    // 鼠标在图像中的坐标（图像像素，非 CSS 像素）
+    const canvasRect = elements.overlayCanvas.getBoundingClientRect();
+    const imgX = (event.clientX - canvasRect.left) * state.imageWidth / canvasRect.width;
+    const imgY = (event.clientY - canvasRect.top) * state.imageHeight / canvasRect.height;
+    // 鼠标在 viewport 可视区内的偏移
+    const viewportRect = elements.viewport.getBoundingClientRect();
+    const cursorViewX = event.clientX - viewportRect.left;
+    const cursorViewY = event.clientY - viewportRect.top;
+    setZoom(newZoom);
+    // viewport padding = 20px（与 styles.css 保持一致）
+    elements.viewport.scrollLeft = 20 + imgX * newZoom - cursorViewX;
+    elements.viewport.scrollTop  = 20 + imgY * newZoom - cursorViewY;
+}
+
 function bindEvents() {
     elements.scanFolderBtn.addEventListener("click", () => scanFolder(elements.folderPathInput.value));
     elements.loadSceneBtn.addEventListener("click", loadScene);
@@ -852,7 +1011,16 @@ function bindEvents() {
     elements.copyPredictionBtn.addEventListener("click", copyPredictionToEditableLayer);
     elements.trainBtn.addEventListener("click", trainModel);
     elements.downloadLabelsBtn.addEventListener("click", () => downloadMask(state.labelMask, "editable_labels.png"));
-    elements.downloadPredictionBtn.addEventListener("click", () => downloadMask(state.predictionMask, "prediction_labels.png"));
+    elements.downloadPredictionBtn.addEventListener("click", () => {
+        if (!state.predictionTifUrl) {
+            setStatus("暂无 AI 结果可导出", "error");
+            return;
+        }
+        const anchor = document.createElement("a");
+        anchor.href = state.predictionTifUrl;
+        anchor.download = "prediction.tif";
+        anchor.click();
+    });
 
     elements.zoomSlider.addEventListener("input", () => setZoom(Number(elements.zoomSlider.value) / 100));
     elements.zoomOutBtn.addEventListener("click", () => setZoom(state.zoom - 0.1));
@@ -869,6 +1037,51 @@ function bindEvents() {
     window.addEventListener("resize", () => {
         if (state.sessionId) {
             configureCanvasSize();
+        }
+    });
+
+    // ── 滚轮缩放 ────────────────────────────────────────────────
+    elements.viewport.addEventListener("wheel", handleWheel, { passive: false });
+
+    // ── 中键拖动平移（fromPointer=false，由 window mouse* 驱动）────
+    window.addEventListener("mousedown", (event) => {
+        if (event.button === 1 && state.sessionId && !panState.active) {
+            event.preventDefault(); // 阻止浏览器自带自动滚动光标
+            beginPan(event.clientX, event.clientY, false);
+        }
+    });
+    window.addEventListener("mousemove", (event) => {
+        // 仅处理中键平移；空格平移由 canvas pointermove（capture）处理
+        if (panState.active && !panState.fromPointer) {
+            continuePan(event.clientX, event.clientY);
+        }
+    });
+    window.addEventListener("mouseup", (event) => {
+        if (event.button === 1 && panState.active && !panState.fromPointer) {
+            endPan();
+        }
+    });
+
+    // ── 空格键切换平移模式 ────────────────────────────────────────
+    window.addEventListener("keydown", (event) => {
+        if (
+            event.code === "Space" &&
+            !(event.target instanceof HTMLInputElement) &&
+            !(event.target instanceof HTMLSelectElement) &&
+            !(event.target instanceof HTMLTextAreaElement)
+        ) {
+            spaceHeld = true;
+            updateCanvasCursor();
+            event.preventDefault(); // 防止页面被空格滚动
+        }
+    });
+    window.addEventListener("keyup", (event) => {
+        if (event.code === "Space") {
+            spaceHeld = false;
+            // 若平移仍在进行则等松手后再恢复光标
+            if (!panState.active) {
+                updateCanvasCursor();
+            }
         }
     });
 }

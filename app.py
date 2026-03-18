@@ -144,8 +144,33 @@ def create_app() -> Flask:
             return error_response("当前会话还没有推理结果。", 404)
         return send_png_bytes(session.prediction_png, f"{session.scene_dir.name}_prediction.png")
 
+    @app.get("/api/sessions/<session_id>/prediction.tif")
+    def api_prediction_tif(session_id: str):
+        """导出带有地理参考的 GeoTIFF 推理结果。"""
+        try:
+            session = get_session(session_id)
+        except KeyError as exc:
+            return error_response(str(exc), 404)
+        if session.prediction_mask is None:
+            return error_response("当前会话还没有推理结果。", 404)
+        try:
+            tif_bytes = encode_prediction_tif(session.prediction_mask, session.train_reference_band)
+        except Exception as exc:
+            return error_response(f"导出 GeoTIFF 失败：{exc}", 500)
+        buffer = io.BytesIO(tif_bytes)
+        buffer.seek(0)
+        response = send_file(
+            buffer,
+            mimetype="image/tiff",
+            download_name=f"{session.scene_dir.name}_prediction.tif",
+            max_age=0,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.post("/api/sessions/<session_id>/train")
     def api_train(session_id: str):
+        """SSE 流式训练接口，实时推送进度事件，最终返回结果。"""
         try:
             session = get_session(session_id)
         except KeyError as exc:
@@ -153,89 +178,131 @@ def create_app() -> Flask:
         if "mask" not in request.files:
             return error_response("训练请求缺少标注掩膜。", 400)
 
+        # 同步读取所有表单数据（SSE 生成器中无法再访问 request）
         try:
-            label_mask = parse_uploaded_mask(request.files["mask"], session.valid_mask.shape)
-            labeled_pixels = int((label_mask > 0).sum())
-            labeled_classes = np.unique(label_mask[label_mask > 0])
-            if labeled_pixels == 0:
-                raise ValueError("至少需要标注一些像素后才能训练。")
-            if labeled_classes.size < 2:
-                raise ValueError("随机森林至少需要 2 个类别才能训练。")
-
+            mask_bytes = request.files["mask"].read()
             n_estimators = clamp_int(request.form.get("nEstimators", "120"), 10, 500)
             max_depth = parse_optional_depth(request.form.get("maxDepth", "18"))
             max_samples_per_class = clamp_int(request.form.get("maxSamplesPerClass", "15000"), 50, 300000)
             neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
             if neighborhood_size % 2 == 0:
-                neighborhood_size += 1  # 确保为奇数
-
+                neighborhood_size += 1
             train_band_keys = request.form.getlist("trainBandPaths")
-            if train_band_keys:
-                train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
-            else:
-                train_band_paths = session.band_paths
-
-            # 判断是否需要重建特征栈
-            need_rebuild = (
-                session.feature_stack is None
-                or session.feature_neighborhood_size != neighborhood_size
-                or [str(p) for p in (session.feature_band_paths or [])] != [str(p) for p in train_band_paths]
-            )
-            if need_rebuild:
-                feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
-                if neighborhood_size > 1:
-                    feat_stack = add_texture_features(feat_stack, neighborhood_size)
-                session.feature_band_paths = train_band_paths
-                session.feature_stack = feat_stack
-                session.feature_valid_mask = feat_valid_mask
-                session.feature_neighborhood_size = neighborhood_size
-
-            feature_stack = session.feature_stack
-            feature_valid_mask = session.feature_valid_mask
-
-            sampled_indices, labeled_distribution = sample_training_indices(label_mask, max_samples_per_class)
-            flat_stack = feature_stack.reshape(-1, feature_stack.shape[-1])
-            train_features = flat_stack[sampled_indices]
-            train_labels = label_mask.reshape(-1)[sampled_indices]
-            finite_mask = np.all(np.isfinite(train_features), axis=1)
-            train_features = train_features[finite_mask]
-            train_labels = train_labels[finite_mask]
-
-            if np.unique(train_labels).size < 2:
-                raise ValueError("有效训练样本不足，可能全部落在无效像素上。")
-
-            model = RandomForestClassifier(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                random_state=42,
-                n_jobs=-1,
-                max_features=None,
-                class_weight="balanced_subsample",
-                bootstrap=True,
-                oob_score=n_estimators >= 50,
-            )
-            model.fit(train_features, train_labels)
-
-            prediction_mask = predict_full_image(model, feature_stack, feature_valid_mask)
-            session.prediction_mask = prediction_mask
-            session.prediction_png = encode_mask_png(prediction_mask)
-
-            prediction_distribution = count_labels(prediction_mask)
-            response = {
-                "message": "训练和推理已完成，可以继续修改 AI 结果后再次迭代。",
-                "labeledPixels": labeled_pixels,
-                "sampledPixels": int(train_labels.size),
-                "trainAccuracy": float(model.score(train_features, train_labels)),
-                "oobScore": float(model.oob_score_) if hasattr(model, "oob_score_") else None,
-                "labeledDistribution": labeled_distribution,
-                "predictionDistribution": prediction_distribution,
-                "predictionUrl": f"/api/sessions/{session_id}/prediction.png?ts={uuid.uuid4().hex}",
-            }
-            return jsonify(response)
         except ValueError as exc:
             return error_response(str(exc), 400)
-        except Exception as exc:
-            return error_response(f"训练失败：{exc}", 500)
+
+        def generate() -> Generator[str, None, None]:
+            def sse(event: str, data: dict) -> str:
+                return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            try:
+                import io as _io
+                from PIL import Image as _Image
+
+                buf = _io.BytesIO(mask_bytes)
+                label_mask = parse_uploaded_mask_bytes(buf, session.valid_mask.shape)
+                labeled_pixels = int((label_mask > 0).sum())
+                labeled_classes = np.unique(label_mask[label_mask > 0])
+                if labeled_pixels == 0:
+                    yield sse("error", {"message": "至少需要标注一些像素后才能训练。"})
+                    return
+                if labeled_classes.size < 2:
+                    yield sse("error", {"message": "随机森林至少需要 2 个类别才能训练。"})
+                    return
+
+                # ── 步骤 1：构建/复用特征栈 ─────────────────────────────
+                yield sse("progress", {"step": "feature", "pct": 0, "message": "正在构建特征矩阵…"})
+                if train_band_keys:
+                    train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
+                else:
+                    train_band_paths = session.band_paths
+
+                need_rebuild = (
+                    session.feature_stack is None
+                    or session.feature_neighborhood_size != neighborhood_size
+                    or [str(p) for p in (session.feature_band_paths or [])] != [str(p) for p in train_band_paths]
+                )
+                if need_rebuild:
+                    feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
+                    if neighborhood_size > 1:
+                        feat_stack = add_texture_features(feat_stack, neighborhood_size)
+                    session.feature_band_paths = train_band_paths
+                    session.feature_stack = feat_stack
+                    session.feature_valid_mask = feat_valid_mask
+                    session.feature_neighborhood_size = neighborhood_size
+                    session.train_reference_band = train_band_paths[0]
+
+                feature_stack = session.feature_stack
+                feature_valid_mask = session.feature_valid_mask
+                yield sse("progress", {"step": "feature", "pct": 20, "message": "特征矩阵就绪"})
+
+                # ── 步骤 2：采样与训练 ───────────────────────────────────
+                yield sse("progress", {"step": "train", "pct": 25, "message": "正在采样训练样本…"})
+                sampled_indices, labeled_distribution = sample_training_indices(label_mask, max_samples_per_class)
+                flat_stack = feature_stack.reshape(-1, feature_stack.shape[-1])
+                train_features = flat_stack[sampled_indices]
+                train_labels = label_mask.reshape(-1)[sampled_indices]
+                finite_mask = np.all(np.isfinite(train_features), axis=1)
+                train_features = train_features[finite_mask]
+                train_labels = train_labels[finite_mask]
+
+                if np.unique(train_labels).size < 2:
+                    yield sse("error", {"message": "有效训练样本不足，可能全部落在无效像素上。"})
+                    return
+
+                yield sse("progress", {"step": "train", "pct": 35, "message": "正在训练随机森林…"})
+                model = RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    random_state=42,
+                    n_jobs=-1,
+                    max_features=None,
+                    class_weight="balanced_subsample",
+                    bootstrap=True,
+                    oob_score=n_estimators >= 50,
+                )
+                model.fit(train_features, train_labels)
+                yield sse("progress", {"step": "train", "pct": 60, "message": "训练完成，开始全图推理…"})
+
+                # ── 步骤 3：分批推理（带进度） ───────────────────────────
+                flat_features = feature_stack.reshape(-1, feature_stack.shape[-1])
+                flat_prediction = np.zeros(flat_features.shape[0], dtype=np.uint8)
+                flat_prediction[~feature_valid_mask.reshape(-1)] = 99
+                valid_indices = np.flatnonzero(feature_valid_mask.reshape(-1))
+                total_valid = valid_indices.size
+                done = 0
+                for start in range(0, total_valid, PREDICT_BATCH_SIZE):
+                    end = start + PREDICT_BATCH_SIZE
+                    batch_indices = valid_indices[start:end]
+                    batch_pred = model.predict(flat_features[batch_indices]).astype(np.uint8)
+                    flat_prediction[batch_indices] = batch_pred
+                    done += len(batch_indices)
+                    pct = 60 + int(done / max(total_valid, 1) * 35)
+                    yield sse("progress", {"step": "infer", "pct": pct,
+                                           "message": f"推理中… {done}/{total_valid} 像素"})
+
+                prediction_mask = flat_prediction.reshape(feature_valid_mask.shape)
+                session.prediction_mask = prediction_mask
+                session.prediction_png = encode_mask_png(prediction_mask)
+
+                prediction_distribution = count_labels(prediction_mask)
+                yield sse("progress", {"step": "done", "pct": 100, "message": "推理完成"})
+                yield sse("result", {
+                    "message": "训练和推理已完成，可以继续修改 AI 结果后再次迭代。",
+                    "labeledPixels": labeled_pixels,
+                    "sampledPixels": int(train_labels.size),
+                    "trainAccuracy": float(model.score(train_features, train_labels)),
+                    "oobScore": float(model.oob_score_) if hasattr(model, "oob_score_") else None,
+                    "labeledDistribution": labeled_distribution,
+                    "predictionDistribution": prediction_distribution,
+                    "predictionUrl": f"/api/sessions/{session_id}/prediction.png?ts={uuid.uuid4().hex}",
+                    "predictionTifUrl": f"/api/sessions/{session_id}/prediction.tif",
+                })
+            except Exception as exc:
+                yield sse("error", {"message": f"训练失败：{exc}"})
+
+        return Response(generate(), mimetype="text/event-stream",
+                        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
     return app
 
@@ -489,6 +556,56 @@ def parse_uploaded_mask(file_storage, expected_shape: Tuple[int, int]) -> np.nda
     return mask
 
 
+def parse_uploaded_mask_bytes(buf: io.BytesIO, expected_shape: Tuple[int, int]) -> np.ndarray:
+    """从 BytesIO 对象解析掩膜（供 SSE 生成器使用）。"""
+    image = Image.open(buf).convert("L")
+    expected_height, expected_width = expected_shape
+    if image.size != (expected_width, expected_height):
+        raise ValueError(
+            f"掩膜尺寸不匹配：收到 {image.size[0]}x{image.size[1]}，期望 {expected_width}x{expected_height}。"
+        )
+    mask = np.asarray(image, dtype=np.uint8)
+    if mask.max() > MAX_CLASS_ID:
+        raise ValueError(f"类别编号不能超过 {MAX_CLASS_ID}。")
+    return mask
+
+
+def encode_prediction_tif(prediction_mask: np.ndarray, reference_band: Optional[Path]) -> bytes:
+    """将推理结果编码为与参考波段坐标投影完全一致的 GeoTIFF。"""
+    height, width = prediction_mask.shape
+    crs = None
+    transform = None
+    if reference_band is not None and reference_band.exists():
+        try:
+            with rasterio.open(reference_band) as ref:
+                crs = ref.crs
+                # 若参考波段尺寸与掩膜不一致（发生了重采样），需重新计算 transform
+                if ref.height == height and ref.width == width:
+                    transform = ref.transform
+                elif ref.transform is not None:
+                    # 根据边界重新算 transform
+                    left, bottom, right, top = ref.bounds
+                    transform = from_bounds(left, bottom, right, top, width, height)
+        except Exception:
+            pass  # 读取参考信息失败时退化为无投影
+
+    buf = io.BytesIO()
+    with rasterio.open(
+        buf,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype=rasterio.uint8,
+        crs=crs,
+        transform=transform,
+        compress="lzw",
+    ) as dst:
+        dst.write(prediction_mask.astype(np.uint8), 1)
+    return buf.getvalue()
+
+
 def sample_training_indices(label_mask: np.ndarray, max_samples_per_class: int) -> Tuple[np.ndarray, List[Dict[str, int]]]:
     rng = np.random.default_rng(42)
     flat = label_mask.reshape(-1)
@@ -550,6 +667,7 @@ def parse_optional_depth(raw_value: str) -> Optional[int]:
 
 
 app = create_app()
+print(app)
 
 
 if __name__ == "__main__":
