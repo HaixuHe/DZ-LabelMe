@@ -24,19 +24,19 @@
     box-sizing: border-box;
 }
 
-html,
+html {
+    height: 100%;
+}
+
 body {
     margin: 0;
-    min-height: 100%;
+    height: 100vh;
+    overflow: hidden;  /* 禁止页面整体滚动，侧边栏内部独立滚动 */
     font-family: "Segoe UI Variable Display", "Microsoft YaHei UI", "PingFang SC", sans-serif;
     color: var(--ink);
     background:
         radial-gradient(circle at top left, rgba(255, 255, 255, 0.55) 0, rgba(255, 255, 255, 0) 34%),
         linear-gradient(135deg, var(--bg-a) 0%, var(--bg-b) 52%, var(--bg-c) 100%);
-}
-
-body {
-    min-height: 100vh;
 }
 
 button,
@@ -65,7 +65,7 @@ button:disabled {
     display: grid;
     grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
     gap: 20px;
-    min-height: 100vh;
+    height: 100%;       /* 固定为视口高度，不随内容增长 */
     padding: 20px;
 }
 
@@ -73,6 +73,24 @@ button:disabled {
     display: flex;
     flex-direction: column;
     gap: 16px;
+    overflow-y: auto;   /* 侧边栏独立滚动 */
+    min-height: 0;
+    /* 自定义滚动条 */
+    scrollbar-width: thin;
+    scrollbar-color: rgba(21, 32, 43, 0.22) transparent;
+}
+
+.sidebar::-webkit-scrollbar {
+    width: 5px;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+    background: rgba(21, 32, 43, 0.22);
+    border-radius: 99px;
+}
+
+.sidebar::-webkit-scrollbar-track {
+    background: transparent;
 }
 
 .brand-panel,
@@ -385,6 +403,8 @@ input[type="color"] {
     display: flex;
     flex-direction: column;
     gap: 16px;
+    height: 100%;       /* 与 sidebar 等高，填满 grid 行 */
+    min-height: 0;
 }
 
 .stage-toolbar,
@@ -466,7 +486,7 @@ input[type="color"] {
 
 .viewport {
     position: relative;
-    height: calc(100vh - 168px);
+    height: 100%;       /* 自动适配父容器，无需魔术数字 */
     overflow: auto;
     padding: 20px;
     background:
@@ -500,13 +520,40 @@ input[type="color"] {
     image-rendering: pixelated;
 }
 
-#overlayCanvas {
-    cursor: crosshair;
+#labelCanvas {
+    cursor: none;
+}
+
+.brush-cursor {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border-radius: 50%;
+    border: 1.5px solid rgba(255, 255, 255, 0.9);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+    transform: translate(-50%, -50%);
+    display: none;
+    z-index: 10;
 }
 
 @media (max-width: 1200px) {
+    body {
+        height: auto;
+        overflow: auto;  /* 移动端恢复整页滚动 */
+    }
+
     .shell {
         grid-template-columns: 1fr;
+        height: auto;
+    }
+
+    .sidebar {
+        overflow-y: visible;
+    }
+
+    .stage {
+        height: auto;
     }
 
     .viewport {

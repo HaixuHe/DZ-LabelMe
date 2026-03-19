@@ -1,5 +1,6 @@
 const elements = {
     folderPathInput: document.getElementById("folderPathInput"),
+    brushCursor: document.getElementById("brushCursor"),
     scanFolderBtn: document.getElementById("scanFolderBtn"),
     redBandSelect: document.getElementById("redBandSelect"),
     greenBandSelect: document.getElementById("greenBandSelect"),
@@ -23,6 +24,8 @@ const elements = {
     nEstimatorsInput: document.getElementById("nEstimatorsInput"),
     maxDepthInput: document.getElementById("maxDepthInput"),
     maxSamplesInput: document.getElementById("maxSamplesInput"),
+    confThresholdInput: document.getElementById("confThresholdInput"),
+    confThresholdValue: document.getElementById("confThresholdValue"),
     trainBtn: document.getElementById("trainBtn"),
     inferProgressWrap: document.getElementById("inferProgressWrap"),
     inferProgressBar: document.getElementById("inferProgressBar"),
@@ -32,7 +35,6 @@ const elements = {
     predictionOpacityInput: document.getElementById("predictionOpacityInput"),
     predictionOpacityValue: document.getElementById("predictionOpacityValue"),
     downloadLabelsBtn: document.getElementById("downloadLabelsBtn"),
-    downloadPredictionBtn: document.getElementById("downloadPredictionBtn"),
     trainStats: document.getElementById("trainStats"),
     fitViewBtn: document.getElementById("fitViewBtn"),
     zoomOutBtn: document.getElementById("zoomOutBtn"),
@@ -44,13 +46,16 @@ const elements = {
     viewport: document.getElementById("viewport"),
     canvasStack: document.getElementById("canvasStack"),
     imageCanvas: document.getElementById("imageCanvas"),
-    overlayCanvas: document.getElementById("overlayCanvas")
+    predictionCanvas: document.getElementById("predictionCanvas"),
+    labelCanvas: document.getElementById("labelCanvas")
 };
 
 const imageContext = elements.imageCanvas.getContext("2d");
-const overlayContext = elements.overlayCanvas.getContext("2d", { willReadFrequently: true });
+const predictionContext = elements.predictionCanvas.getContext("2d", { willReadFrequently: true });
+const labelContext = elements.labelCanvas.getContext("2d", { willReadFrequently: true });
 imageContext.imageSmoothingEnabled = false;
-overlayContext.imageSmoothingEnabled = false;
+predictionContext.imageSmoothingEnabled = false;
+labelContext.imageSmoothingEnabled = false;
 
 const state = {
     sceneBands: [],
@@ -63,7 +68,6 @@ const state = {
     previewImage: null,
     labelMask: null,
     predictionMask: null,
-    overlayImageData: null,
     labelLookup: buildBlankLookup(),
     predictionLookup: buildBlankLookup(),
     classes: [
@@ -91,6 +95,10 @@ const state = {
 const panState = { active: false, fromPointer: false, startX: 0, startY: 0, scrollX: 0, scrollY: 0 };
 let spaceHeld = false;
 
+// 每个层单独维护自己的 ImageData
+const labelImageData = { data: null };
+const predictionImageData = { data: null };
+
 function buildBlankLookup() {
     return new Uint8ClampedArray(256 * 4);
 }
@@ -110,20 +118,19 @@ function hexToRgb(hex) {
 function refreshColorLookup() {
     state.labelLookup = buildBlankLookup();
     state.predictionLookup = buildBlankLookup();
-    const labelAlpha = Math.round(state.labelOpacity * 255);
-    const predictionAlpha = Math.round(state.predictionOpacity * 255);
+    // 不再将 alpha 内嵌到象素，透明度由 canvas.style.opacity 控制
     for (const category of state.classes) {
         const { r, g, b } = hexToRgb(category.color);
-        const labelOffset = category.id * 4;
-        state.labelLookup[labelOffset] = r;
-        state.labelLookup[labelOffset + 1] = g;
-        state.labelLookup[labelOffset + 2] = b;
-        state.labelLookup[labelOffset + 3] = labelAlpha;
+        const offset = category.id * 4;
+        state.labelLookup[offset] = r;
+        state.labelLookup[offset + 1] = g;
+        state.labelLookup[offset + 2] = b;
+        state.labelLookup[offset + 3] = 255;
 
-        state.predictionLookup[labelOffset] = r;
-        state.predictionLookup[labelOffset + 1] = g;
-        state.predictionLookup[labelOffset + 2] = b;
-        state.predictionLookup[labelOffset + 3] = predictionAlpha;
+        state.predictionLookup[offset] = r;
+        state.predictionLookup[offset + 1] = g;
+        state.predictionLookup[offset + 2] = b;
+        state.predictionLookup[offset + 3] = 255;
     }
 }
 
@@ -139,7 +146,6 @@ function setBusy(busy, message) {
     elements.trainBtn.disabled = disabled;
     elements.scanFolderBtn.disabled = disabled;
     elements.copyPredictionBtn.disabled = disabled || !state.predictionMask;
-    elements.downloadPredictionBtn.disabled = disabled || !state.predictionMask;
     if (message) {
         setStatus(message, busy ? "busy" : "");
     }
@@ -257,32 +263,39 @@ function createEmptyMask() {
 }
 
 function configureCanvasSize() {
-    const imageCanvasNeedsResize = elements.imageCanvas.width !== state.imageWidth || elements.imageCanvas.height !== state.imageHeight;
-    const overlayCanvasNeedsResize = elements.overlayCanvas.width !== state.imageWidth || elements.overlayCanvas.height !== state.imageHeight;
+    const needResizeImage = elements.imageCanvas.width !== state.imageWidth || elements.imageCanvas.height !== state.imageHeight;
+    const needResizeLabel = elements.labelCanvas.width !== state.imageWidth || elements.labelCanvas.height !== state.imageHeight;
+    const needResizePrediction = elements.predictionCanvas.width !== state.imageWidth || elements.predictionCanvas.height !== state.imageHeight;
 
-    if (imageCanvasNeedsResize) {
+    if (needResizeImage) {
         elements.imageCanvas.width = state.imageWidth;
         elements.imageCanvas.height = state.imageHeight;
     }
-    if (overlayCanvasNeedsResize) {
-        elements.overlayCanvas.width = state.imageWidth;
-        elements.overlayCanvas.height = state.imageHeight;
-        state.overlayImageData = null;
+    if (needResizeLabel) {
+        elements.labelCanvas.width = state.imageWidth;
+        elements.labelCanvas.height = state.imageHeight;
+        labelImageData.data = null;
+    }
+    if (needResizePrediction) {
+        elements.predictionCanvas.width = state.imageWidth;
+        elements.predictionCanvas.height = state.imageHeight;
+        predictionImageData.data = null;
     }
 
-    elements.canvasStack.style.width = `${state.imageWidth * state.zoom}px`;
-    elements.canvasStack.style.height = `${state.imageHeight * state.zoom}px`;
-    elements.imageCanvas.style.width = `${state.imageWidth * state.zoom}px`;
-    elements.imageCanvas.style.height = `${state.imageHeight * state.zoom}px`;
-    elements.overlayCanvas.style.width = `${state.imageWidth * state.zoom}px`;
-    elements.overlayCanvas.style.height = `${state.imageHeight * state.zoom}px`;
+    const w = `${state.imageWidth * state.zoom}px`;
+    const h = `${state.imageHeight * state.zoom}px`;
+    elements.canvasStack.style.width = w;
+    elements.canvasStack.style.height = h;
+    elements.imageCanvas.style.width = w;
+    elements.imageCanvas.style.height = h;
+    elements.predictionCanvas.style.width = w;
+    elements.predictionCanvas.style.height = h;
+    elements.labelCanvas.style.width = w;
+    elements.labelCanvas.style.height = h;
 
-    if (imageCanvasNeedsResize && state.previewImage) {
-        drawBaseImage();
-    }
-    if (overlayCanvasNeedsResize && state.labelMask) {
-        rebuildOverlay();
-    }
+    if (needResizeImage && state.previewImage) { drawBaseImage(); }
+    if (needResizeLabel && state.labelMask) { rebuildLabelLayer(); }
+    if (needResizePrediction && state.predictionMask) { rebuildPredictionLayer(); }
 }
 
 function setZoom(zoomValue) {
@@ -321,56 +334,76 @@ function drawBaseImage() {
     imageContext.drawImage(state.previewImage, 0, 0, state.imageWidth, state.imageHeight);
 }
 
-function ensureOverlayImageData() {
-    if (!state.overlayImageData || state.overlayImageData.width !== state.imageWidth || state.overlayImageData.height !== state.imageHeight) {
-        state.overlayImageData = overlayContext.createImageData(state.imageWidth, state.imageHeight);
+function ensureLabelImageData() {
+    if (!labelImageData.data || labelImageData.data.width !== state.imageWidth || labelImageData.data.height !== state.imageHeight) {
+        labelImageData.data = labelContext.createImageData(state.imageWidth, state.imageHeight);
     }
 }
 
-function applyVisiblePixel(data, pixelIndex) {
-    const byteOffset = pixelIndex * 4;
-    const labelValue = state.showLabels && state.labelMask ? state.labelMask[pixelIndex] : 0;
-    if (labelValue > 0) {
-        const lookupOffset = labelValue * 4;
-        data[byteOffset] = state.labelLookup[lookupOffset];
-        data[byteOffset + 1] = state.labelLookup[lookupOffset + 1];
-        data[byteOffset + 2] = state.labelLookup[lookupOffset + 2];
-        data[byteOffset + 3] = state.labelLookup[lookupOffset + 3];
-        return;
+function ensurePredictionImageData() {
+    if (!predictionImageData.data || predictionImageData.data.width !== state.imageWidth || predictionImageData.data.height !== state.imageHeight) {
+        predictionImageData.data = predictionContext.createImageData(state.imageWidth, state.imageHeight);
     }
-
-    const predictionValue = state.showPrediction && state.predictionMask ? state.predictionMask[pixelIndex] : 0;
-    if (predictionValue > 0) {
-        const lookupOffset = predictionValue * 4;
-        data[byteOffset] = state.predictionLookup[lookupOffset];
-        data[byteOffset + 1] = state.predictionLookup[lookupOffset + 1];
-        data[byteOffset + 2] = state.predictionLookup[lookupOffset + 2];
-        data[byteOffset + 3] = state.predictionLookup[lookupOffset + 3];
-        return;
-    }
-
-    data[byteOffset] = 0;
-    data[byteOffset + 1] = 0;
-    data[byteOffset + 2] = 0;
-    data[byteOffset + 3] = 0;
 }
 
-function rebuildOverlay() {
+// 刷新人工标注层
+function rebuildLabelLayer() {
     if (!state.labelMask || !state.imageWidth || !state.imageHeight) {
-        overlayContext.clearRect(0, 0, elements.overlayCanvas.width, elements.overlayCanvas.height);
+        labelContext.clearRect(0, 0, elements.labelCanvas.width, elements.labelCanvas.height);
         return;
     }
-    ensureOverlayImageData();
-    const data = state.overlayImageData.data;
-    for (let index = 0; index < state.labelMask.length; index += 1) {
-        applyVisiblePixel(data, index);
+    ensureLabelImageData();
+    const pixels = labelImageData.data.data;
+    for (let i = 0; i < state.labelMask.length; i++) {
+        const base = i * 4;
+        const v = state.labelMask[i];
+        if (v > 0) {
+            const lut = v * 4;
+            pixels[base]     = state.labelLookup[lut];
+            pixels[base + 1] = state.labelLookup[lut + 1];
+            pixels[base + 2] = state.labelLookup[lut + 2];
+            pixels[base + 3] = 255;
+        } else {
+            pixels[base + 3] = 0;
+        }
     }
-    overlayContext.putImageData(state.overlayImageData, 0, 0);
+    labelContext.putImageData(labelImageData.data, 0, 0);
+}
+
+// 刷新 AI 预测层
+function rebuildPredictionLayer() {
+    if (!state.predictionMask || !state.imageWidth || !state.imageHeight) {
+        predictionContext.clearRect(0, 0, elements.predictionCanvas.width, elements.predictionCanvas.height);
+        return;
+    }
+    ensurePredictionImageData();
+    const pixels = predictionImageData.data.data;
+    for (let i = 0; i < state.predictionMask.length; i++) {
+        const base = i * 4;
+        const v = state.predictionMask[i];
+        // 99 为无效类，显示为透明
+        if (v > 0 && v !== 99) {
+            const lut = v * 4;
+            pixels[base]     = state.predictionLookup[lut];
+            pixels[base + 1] = state.predictionLookup[lut + 1];
+            pixels[base + 2] = state.predictionLookup[lut + 2];
+            pixels[base + 3] = 255;
+        } else {
+            pixels[base + 3] = 0;
+        }
+    }
+    predictionContext.putImageData(predictionImageData.data, 0, 0);
+}
+
+// 局部刷新标注层的矩形块
+function rebuildOverlay() {
+    rebuildLabelLayer();
+    rebuildPredictionLayer();
 }
 
 function updateOverlayPatch(x0, y0, x1, y1) {
-    if (!state.overlayImageData) {
-        rebuildOverlay();
+    if (!labelImageData.data) {
+        rebuildLabelLayer();
         return;
     }
 
@@ -378,21 +411,29 @@ function updateOverlayPatch(x0, y0, x1, y1) {
     const minY = Math.max(0, Math.min(y0, y1));
     const maxX = Math.min(state.imageWidth - 1, Math.max(x0, x1));
     const maxY = Math.min(state.imageHeight - 1, Math.max(y0, y1));
-    const data = state.overlayImageData.data;
+    const pixels = labelImageData.data.data;
 
-    for (let y = minY; y <= maxY; y += 1) {
+    for (let y = minY; y <= maxY; y++) {
         const rowOffset = y * state.imageWidth;
-        for (let x = minX; x <= maxX; x += 1) {
-            applyVisiblePixel(data, rowOffset + x);
+        for (let x = minX; x <= maxX; x++) {
+            const base = (rowOffset + x) * 4;
+            const v = state.labelMask[rowOffset + x];
+            if (v > 0) {
+                const lut = v * 4;
+                pixels[base]     = state.labelLookup[lut];
+                pixels[base + 1] = state.labelLookup[lut + 1];
+                pixels[base + 2] = state.labelLookup[lut + 2];
+                pixels[base + 3] = 255;
+            } else {
+                pixels[base + 3] = 0;
+            }
         }
     }
 
-    overlayContext.putImageData(
-        state.overlayImageData,
-        0,
-        0,
-        minX,
-        minY,
+    labelContext.putImageData(
+        labelImageData.data,
+        0, 0,
+        minX, minY,
         maxX - minX + 1,
         maxY - minY + 1
     );
@@ -472,14 +513,11 @@ function paintStroke(fromX, fromY, toX, toY) {
 }
 
 function eventToPixel(event) {
-    if (!state.imageWidth || !state.imageHeight) {
-        return null;
-    }
-    const rect = elements.overlayCanvas.getBoundingClientRect();
-    const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
-    if (!inside) {
-        return null;
-    }
+    if (!state.imageWidth || !state.imageHeight) { return null; }
+    const rect = elements.labelCanvas.getBoundingClientRect();
+    const inside = event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    if (!inside) { return null; }
     const x = Math.floor((event.clientX - rect.left) * (state.imageWidth / rect.width));
     const y = Math.floor((event.clientY - rect.top) * (state.imageHeight / rect.height));
     return {
@@ -593,11 +631,13 @@ async function loadScene() {
         }
         state.labelMask = createEmptyMask();
         state.predictionMask = null;
-        state.overlayImageData = null;
+        labelImageData.data = null;
+        predictionImageData.data = null;
         fitView();
         drawBaseImage();
         refreshColorLookup();
-        rebuildOverlay();
+        rebuildLabelLayer();
+        rebuildPredictionLayer();
         elements.trainStats.innerHTML = [
             `<div><strong>当前场景：</strong>${payload.sceneName}</div>`,
             `<div><strong>尺寸：</strong>${payload.width} × ${payload.height}</div>`,
@@ -606,7 +646,6 @@ async function loadScene() {
             `<div><strong>可用波段数：</strong>${(payload.allBands || []).length} 个（已全选用于训练）</div>`
         ].join("");
         elements.copyPredictionBtn.disabled = true;
-        elements.downloadPredictionBtn.disabled = true;
         elements.downloadLabelsBtn.disabled = false;
         setStatus("合成图已加载，可以开始逐像素标注", "success");
     } catch (error) {
@@ -677,6 +716,7 @@ async function trainModel() {
         formData.append("nEstimators", elements.nEstimatorsInput.value || "120");
         formData.append("maxDepth", elements.maxDepthInput.value || "18");
         formData.append("maxSamplesPerClass", elements.maxSamplesInput.value || "15000");
+        formData.append("confThreshold", elements.confThresholdInput.value || "0.95");
         formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
         const selectedBands = [...elements.trainBandsSelect.selectedOptions].map((opt) => opt.value);
         for (const key of selectedBands) {
@@ -728,10 +768,10 @@ async function trainModel() {
                     state.predictionMask = await readMaskFromImage(data.predictionUrl);
                     state.predictionTifUrl = data.predictionTifUrl || null;
                     refreshColorLookup();
-                    rebuildOverlay();
+                    rebuildPredictionLayer();
+                    rebuildLabelLayer();
                     renderTrainStats(data);
                     elements.copyPredictionBtn.disabled = false;
-                    elements.downloadPredictionBtn.disabled = false;
                     setStatus(data.message || "推理完成", "success");
                 } else if (eventType === "error") {
                     throw new Error(data.message || "训练失败");
@@ -747,11 +787,9 @@ async function trainModel() {
 }
 
 function clearEditableLayer() {
-    if (!state.labelMask) {
-        return;
-    }
+    if (!state.labelMask) { return; }
     state.labelMask.fill(0);
-    rebuildOverlay();
+    rebuildLabelLayer();
     setStatus("可编辑层已清空", "success");
 }
 
@@ -760,9 +798,17 @@ function copyPredictionToEditableLayer() {
         setStatus("当前没有 AI 结果可复制", "error");
         return;
     }
-    state.labelMask.set(state.predictionMask);
-    rebuildOverlay();
-    setStatus("AI 结果已复制到可编辑层，可继续精修", "success");
+    for (let i = 0; i < state.predictionMask.length; i++) {
+        state.labelMask[i] = state.predictionMask[i] === 99 ? 0 : state.predictionMask[i];
+    }
+    // 重置 AI 推理状态，进入全新标注/训练流程
+    state.predictionMask = null;
+    state.predictionTifUrl = null;
+    predictionImageData.data = null;
+    predictionContext.clearRect(0, 0, elements.predictionCanvas.width, elements.predictionCanvas.height);
+    elements.copyPredictionBtn.disabled = true;
+    rebuildLabelLayer();
+    setStatus("AI 结果已复制到可编辑层，已重置推理状态，可重新训练", "success");
 }
 
 function downloadMask(mask, filename) {
@@ -797,7 +843,7 @@ function addClass() {
     elements.newClassName.value = "";
     renderClassList();
     refreshColorLookup();
-    rebuildOverlay();
+    rebuildLabelLayer();
     setStatus(`已添加 ${name}`, "success");
 }
 
@@ -805,55 +851,44 @@ function handlePointerDown(event) {
     if (event.button !== 0 || !state.labelMask || state.isBusy || state.isInferring) {
         return;
     }
-    // 空格键按下时左键拖动为平移（fromPointer=true 表示由 canvas capture 驱动）
     if (spaceHeld) {
         beginPan(event.clientX, event.clientY, true);
-        elements.overlayCanvas.setPointerCapture?.(event.pointerId);
+        elements.labelCanvas.setPointerCapture?.(event.pointerId);
         return;
     }
     const point = eventToPixel(event);
-    if (!point) {
-        return;
-    }
+    if (!point) { return; }
     state.drawing = true;
     state.lastPoint = point;
     paintStroke(point.x, point.y, point.x, point.y);
     updateCursorInfo(point.x, point.y);
-    elements.overlayCanvas.setPointerCapture?.(event.pointerId);
+    elements.labelCanvas.setPointerCapture?.(event.pointerId);
 }
 
 function handlePointerMove(event) {
-    // 空格+左键平移（pointer 已被 canvas capture）
     if (panState.active && panState.fromPointer) {
         continuePan(event.clientX, event.clientY);
         return;
     }
+    updateBrushCursor(event.clientX, event.clientY);
     const point = eventToPixel(event);
-    if (!point) {
-        updateCursorInfo(null, null);
-        return;
-    }
+    if (!point) { updateCursorInfo(null, null); return; }
     updateCursorInfo(point.x, point.y);
-    if (!state.drawing || !state.lastPoint) {
-        return;
-    }
+    if (!state.drawing || !state.lastPoint) { return; }
     paintStroke(state.lastPoint.x, state.lastPoint.y, point.x, point.y);
     state.lastPoint = point;
 }
 
 function handlePointerUp(event) {
-    // 空格平移结束
     if (panState.active && panState.fromPointer) {
         endPan();
-        elements.overlayCanvas.releasePointerCapture?.(event.pointerId);
+        elements.labelCanvas.releasePointerCapture?.(event.pointerId);
         return;
     }
-    if (!state.drawing) {
-        return;
-    }
+    if (!state.drawing) { return; }
     state.drawing = false;
     state.lastPoint = null;
-    elements.overlayCanvas.releasePointerCapture?.(event.pointerId);
+    elements.labelCanvas.releasePointerCapture?.(event.pointerId);
 }
 
 function handleShortcuts(event) {
@@ -901,38 +936,59 @@ function handleShortcuts(event) {
 function syncBrushSize() {
     state.brushSize = Number(elements.brushSizeInput.value);
     elements.brushSizeValue.textContent = state.brushSize;
+    // 同步更新画笔光标大小（若正在悬停则即时更新）
+    const diameter = (state.brushSize * 2 + 1) * state.zoom;
+    elements.brushCursor.style.width = `${diameter}px`;
+    elements.brushCursor.style.height = `${diameter}px`;
 }
 
 function syncLabelOpacity() {
     state.labelOpacity = Number(elements.labelOpacityInput.value) / 100;
     elements.labelOpacityValue.textContent = `${Math.round(state.labelOpacity * 100)}%`;
-    refreshColorLookup();
-    rebuildOverlay();
+    elements.labelCanvas.style.opacity = state.labelOpacity;
 }
 
 function syncPredictionOpacity() {
     state.predictionOpacity = Number(elements.predictionOpacityInput.value) / 100;
     elements.predictionOpacityValue.textContent = `${Math.round(state.predictionOpacity * 100)}%`;
-    refreshColorLookup();
-    rebuildOverlay();
+    elements.predictionCanvas.style.opacity = state.predictionOpacity;
 }
 
 function syncVisibility() {
     state.showLabels = elements.showLabelsInput.checked;
     state.showPrediction = elements.showPredictionInput.checked;
-    rebuildOverlay();
+    elements.labelCanvas.style.display = state.showLabels ? "" : "none";
+    elements.predictionCanvas.style.display = state.showPrediction ? "" : "none";
 }
 
 // ── 平移与缩放辅助函数 ────────────────────────────────────────
 
 function updateCanvasCursor() {
     if (panState.active) {
-        elements.overlayCanvas.style.cursor = "grabbing";
+        elements.labelCanvas.style.cursor = "grabbing";
+        elements.brushCursor.style.display = "none";
     } else if (spaceHeld && state.sessionId) {
-        elements.overlayCanvas.style.cursor = "grab";
+        elements.labelCanvas.style.cursor = "grab";
+        elements.brushCursor.style.display = "none";
     } else {
-        elements.overlayCanvas.style.cursor = ""; // 回退到 CSS crosshair
+        elements.labelCanvas.style.cursor = "none";
     }
+}
+
+function updateBrushCursor(clientX, clientY) {
+    if (panState.active || spaceHeld || !state.sessionId) {
+        elements.brushCursor.style.display = "none";
+        return;
+    }
+    const rect = elements.canvasStack.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    const diameter = (state.brushSize * 2 + 1) * state.zoom;
+    elements.brushCursor.style.left = `${x}px`;
+    elements.brushCursor.style.top = `${y}px`;
+    elements.brushCursor.style.width = `${diameter}px`;
+    elements.brushCursor.style.height = `${diameter}px`;
+    elements.brushCursor.style.display = "block";
 }
 
 function beginPan(clientX, clientY, fromPointer) {
@@ -977,7 +1033,7 @@ function handleWheel(event) {
         return;
     }
     // 鼠标在图像中的坐标（图像像素，非 CSS 像素）
-    const canvasRect = elements.overlayCanvas.getBoundingClientRect();
+    const canvasRect = elements.labelCanvas.getBoundingClientRect();
     const imgX = (event.clientX - canvasRect.left) * state.imageWidth / canvasRect.width;
     const imgY = (event.clientY - canvasRect.top) * state.imageHeight / canvasRect.height;
     // 鼠标在 viewport 可视区内的偏移
@@ -1005,33 +1061,57 @@ function bindEvents() {
     elements.brushSizeInput.addEventListener("input", syncBrushSize);
     elements.labelOpacityInput.addEventListener("input", syncLabelOpacity);
     elements.predictionOpacityInput.addEventListener("input", syncPredictionOpacity);
+    elements.confThresholdInput.addEventListener("input", () => {
+        elements.confThresholdValue.textContent = parseFloat(elements.confThresholdInput.value).toFixed(2);
+    });
     elements.showLabelsInput.addEventListener("change", syncVisibility);
     elements.showPredictionInput.addEventListener("change", syncVisibility);
     elements.clearLabelsBtn.addEventListener("click", clearEditableLayer);
     elements.copyPredictionBtn.addEventListener("click", copyPredictionToEditableLayer);
     elements.trainBtn.addEventListener("click", trainModel);
-    elements.downloadLabelsBtn.addEventListener("click", () => downloadMask(state.labelMask, "editable_labels.png"));
-    elements.downloadPredictionBtn.addEventListener("click", () => {
-        if (!state.predictionTifUrl) {
-            setStatus("暂无 AI 结果可导出", "error");
+    elements.downloadLabelsBtn.addEventListener("click", async () => {
+        if (!state.labelMask || !state.sessionId) {
+            setStatus("当前没有可导出的标注", "error");
             return;
         }
-        const anchor = document.createElement("a");
-        anchor.href = state.predictionTifUrl;
-        anchor.download = "prediction.tif";
-        anchor.click();
+        try {
+            setBusy(true, "正在导出标注 TIF…");
+            const formData = new FormData();
+            formData.append("mask", await maskToBlob(state.labelMask), "labels.png");
+            const response = await fetch(`/api/sessions/${state.sessionId}/labels.tif`, {
+                method: "POST",
+                body: formData
+            });
+            if (!response.ok) {
+                const payload = await response.json().catch(() => ({}));
+                throw new Error(payload.error || `导出失败：${response.status}`);
+            }
+            const blob = await response.blob();
+            const anchor = document.createElement("a");
+            anchor.href = URL.createObjectURL(blob);
+            anchor.download = "labels.tif";
+            anchor.click();
+            URL.revokeObjectURL(anchor.href);
+            setStatus("标注 TIF 导出成功", "success");
+        } catch (error) {
+            setStatus(error.message, "error");
+        } finally {
+            setBusy(false);
+        }
     });
-
     elements.zoomSlider.addEventListener("input", () => setZoom(Number(elements.zoomSlider.value) / 100));
     elements.zoomOutBtn.addEventListener("click", () => setZoom(state.zoom - 0.1));
     elements.zoomInBtn.addEventListener("click", () => setZoom(state.zoom + 0.1));
     elements.fitViewBtn.addEventListener("click", fitView);
 
-    elements.overlayCanvas.addEventListener("pointerdown", handlePointerDown);
-    elements.overlayCanvas.addEventListener("pointermove", handlePointerMove);
-    elements.overlayCanvas.addEventListener("pointerup", handlePointerUp);
-    elements.overlayCanvas.addEventListener("pointerleave", () => updateCursorInfo(null, null));
-    elements.overlayCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    elements.labelCanvas.addEventListener("pointerdown", handlePointerDown);
+    elements.labelCanvas.addEventListener("pointermove", handlePointerMove);
+    elements.labelCanvas.addEventListener("pointerup", handlePointerUp);
+    elements.labelCanvas.addEventListener("pointerleave", () => {
+        updateCursorInfo(null, null);
+        elements.brushCursor.style.display = "none";
+    });
+    elements.labelCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
     window.addEventListener("pointerup", handlePointerUp);
     window.addEventListener("keydown", handleShortcuts);
     window.addEventListener("resize", () => {
@@ -1095,7 +1175,6 @@ function initialize() {
     syncPredictionOpacity();
     bindEvents();
     elements.copyPredictionBtn.disabled = true;
-    elements.downloadPredictionBtn.disabled = true;
     elements.downloadLabelsBtn.disabled = true;
     elements.folderPathInput.value = window.APP_CONFIG.workspaceRoot || "";
 }

@@ -17,7 +17,7 @@ from PIL import Image
 from rasterio.enums import Resampling
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import from_bounds
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import minimum_filter, uniform_filter
 from sklearn.ensemble import RandomForestClassifier
 
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
@@ -168,6 +168,40 @@ def create_app() -> Flask:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    @app.post("/api/sessions/<session_id>/labels.tif")
+    def api_labels_tif(session_id: str):
+        """上传标注掩膜，返回带地理投影的 GeoTIFF，未标注和 99 的像素设为 nodata。"""
+        try:
+            session = get_session(session_id)
+        except KeyError as exc:
+            return error_response(str(exc), 404)
+        if "mask" not in request.files:
+            return error_response("缺少标注掩膜文件。", 400)
+        try:
+            mask_bytes = request.files["mask"].read()
+            buf = io.BytesIO(mask_bytes)
+            label_mask = parse_uploaded_mask_bytes(buf, session.valid_mask.shape)
+        except ValueError as exc:
+            return error_response(str(exc), 400)
+        except Exception as exc:
+            return error_response(f"解析标注掩膜失败：{exc}", 500)
+        # 参考波段：优先用训练参考波段，否则用预览波段
+        reference_band = session.train_reference_band or (session.band_paths[0] if session.band_paths else None)
+        try:
+            tif_bytes = encode_prediction_tif(label_mask, reference_band)
+        except Exception as exc:
+            return error_response(f"导出 GeoTIFF 失败：{exc}", 500)
+        buffer = io.BytesIO(tif_bytes)
+        buffer.seek(0)
+        response = send_file(
+            buffer,
+            mimetype="image/tiff",
+            download_name=f"{session.scene_dir.name}_labels.tif",
+            max_age=0,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.post("/api/sessions/<session_id>/train")
     def api_train(session_id: str):
         """SSE 流式训练接口，实时推送进度事件，最终返回结果。"""
@@ -187,6 +221,8 @@ def create_app() -> Flask:
             neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
             if neighborhood_size % 2 == 0:
                 neighborhood_size += 1
+            conf_threshold = float(request.form.get("confThreshold", "0.95"))
+            conf_threshold = max(0.50, min(0.99, conf_threshold))
             train_band_keys = request.form.getlist("trainBandPaths")
         except ValueError as exc:
             return error_response(str(exc), 400)
@@ -245,6 +281,10 @@ def create_app() -> Flask:
                 finite_mask = np.all(np.isfinite(train_features), axis=1)
                 train_features = train_features[finite_mask]
                 train_labels = train_labels[finite_mask]
+                # 排除所有波段数值完全相同的样本（全同质背景像素）
+                valid_sample_mask = np.ptp(train_features, axis=1) != 0
+                train_features = train_features[valid_sample_mask]
+                train_labels = train_labels[valid_sample_mask]
 
                 if np.unique(train_labels).size < 2:
                     yield sse("error", {"message": "有效训练样本不足，可能全部落在无效像素上。"})
@@ -266,22 +306,53 @@ def create_app() -> Flask:
 
                 # ── 步骤 3：分批推理（带进度） ───────────────────────────
                 flat_features = feature_stack.reshape(-1, feature_stack.shape[-1])
-                flat_prediction = np.zeros(flat_features.shape[0], dtype=np.uint8)
-                flat_prediction[~feature_valid_mask.reshape(-1)] = 99
+                n_pixels = flat_features.shape[0]
+                flat_prediction = np.full(n_pixels, 99, dtype=np.uint8)
+                flat_confidence = np.zeros(n_pixels, dtype=np.float32)
                 valid_indices = np.flatnonzero(feature_valid_mask.reshape(-1))
-                total_valid = valid_indices.size
+
+                # 跳过所有波段数值完全相同的像素（全同质背景），直接赋 99
+                _vf = flat_features[valid_indices]
+                _all_same = np.ptp(_vf, axis=1) == 0
+                infer_indices = valid_indices[~_all_same]
+                del _vf, _all_same
+
+                total_valid = infer_indices.size
                 done = 0
                 for start in range(0, total_valid, PREDICT_BATCH_SIZE):
                     end = start + PREDICT_BATCH_SIZE
-                    batch_indices = valid_indices[start:end]
-                    batch_pred = model.predict(flat_features[batch_indices]).astype(np.uint8)
-                    flat_prediction[batch_indices] = batch_pred
+                    batch_indices = infer_indices[start:end]
+                    batch_proba = model.predict_proba(flat_features[batch_indices])
+                    flat_prediction[batch_indices] = model.classes_[
+                        batch_proba.argmax(axis=1)].astype(np.uint8)
+                    flat_confidence[batch_indices] = batch_proba.max(axis=1)
                     done += len(batch_indices)
-                    pct = 60 + int(done / max(total_valid, 1) * 35)
+                    pct = 60 + int(done / max(total_valid, 1) * 30)
                     yield sse("progress", {"step": "infer", "pct": pct,
                                            "message": f"推理中… {done}/{total_valid} 像素"})
 
-                prediction_mask = flat_prediction.reshape(feature_valid_mask.shape)
+                # ── 步骤 4：置信度 + 5x5 均质性双重过滤 ────────────
+                yield sse("progress", {"step": "filter", "pct": 92,
+                                       "message": "应用置信度与 20x20 均质性过滤…"})
+                pred_2d = flat_prediction.reshape(feature_valid_mask.shape)
+                conf_2d = flat_confidence.reshape(feature_valid_mask.shape)
+
+                # 条件 1：置信度高于阈值
+                conf_ok = conf_2d >= conf_threshold
+
+                # 条件 2：20x20 邻域全同类（minimum_filter 每类 O(n)，纯 C 实现）
+                homogeneous = np.zeros(pred_2d.shape, dtype=bool)
+                for cls in np.unique(pred_2d):
+                    if cls == 99:
+                        continue
+                    same = (pred_2d == cls).view(np.uint8)
+                    homogeneous |= minimum_filter(
+                        same, size=20, mode="constant", cval=0).astype(bool)
+
+                # 两个条件同时满足才保留，其他设为 99
+                prediction_mask = pred_2d.copy()
+                prediction_mask[~(conf_ok & homogeneous)] = 99
+
                 session.prediction_mask = prediction_mask
                 session.prediction_png = encode_mask_png(prediction_mask)
 
@@ -601,6 +672,7 @@ def encode_prediction_tif(prediction_mask: np.ndarray, reference_band: Optional[
         crs=crs,
         transform=transform,
         compress="lzw",
+        nodata=99,
     ) as dst:
         dst.write(prediction_mask.astype(np.uint8), 1)
     return buf.getvalue()
