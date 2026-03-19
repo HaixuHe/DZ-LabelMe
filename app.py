@@ -248,12 +248,10 @@ def create_app() -> Flask:
             n_estimators = clamp_int(request.form.get("nEstimators", "120"), 10, 500)
             max_depth = parse_optional_depth(request.form.get("maxDepth", "18"))
             max_samples_per_class = clamp_int(request.form.get("maxSamplesPerClass", "15000"), 50, 300000)
-            neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
-            if neighborhood_size % 2 == 0:
-                neighborhood_size += 1
+            neighborhood_size = 3  # 固定 3×3
             conf_threshold = float(request.form.get("confThreshold", "0.95"))
             conf_threshold = max(0.50, min(0.99, conf_threshold))
-            train_band_keys = request.form.getlist("trainBandPaths")
+            train_band_keys = []  # 由后端自动选取（排除 B1/B3）
         except ValueError as exc:
             return error_response(str(exc), 400)
 
@@ -287,6 +285,9 @@ def create_app() -> Flask:
                 )
                 if need_rebuild:
                     feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
+                    # 在原始波段上排除「全波段值相同」或「全为 nodata/零」的边界像素，
+                    # 这类像素 ptp==0，送入 RF 无意义且拖慢推理
+                    feat_valid_mask &= (np.ptp(feat_stack, axis=-1) != 0)
                     if neighborhood_size > 1:
                         feat_stack = add_texture_features(feat_stack, neighborhood_size)
                     session.feature_band_paths = train_band_paths
@@ -419,10 +420,7 @@ def create_app() -> Flask:
             return error_response("缺少标注掩膜。", 400)
         try:
             mask_bytes = request.files["mask"].read()
-            neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
-            if neighborhood_size % 2 == 0:
-                neighborhood_size += 1
-            train_band_keys = request.form.getlist("trainBandPaths")
+            neighborhood_size = 3  # 固定 3×3
         except ValueError as exc:
             return error_response(str(exc), 400)
         try:
@@ -434,10 +432,7 @@ def create_app() -> Flask:
         if labeled_pixels == 0:
             return error_response("当前没有任何标注像素，无法保存到训练池。", 400)
         try:
-            if train_band_keys:
-                train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
-            else:
-                train_band_paths = session.band_paths
+            train_band_paths = get_train_band_paths(session)
             need_rebuild = (
                 session.feature_stack is None
                 or session.feature_neighborhood_size != neighborhood_size
@@ -445,8 +440,7 @@ def create_app() -> Flask:
             )
             if need_rebuild:
                 feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
-                if neighborhood_size > 1:
-                    feat_stack = add_texture_features(feat_stack, neighborhood_size)
+                feat_stack = add_texture_features(feat_stack, neighborhood_size)
                 session.feature_band_paths = train_band_paths
                 session.feature_stack = feat_stack
                 session.feature_valid_mask = feat_valid_mask
@@ -648,12 +642,9 @@ def create_app() -> Flask:
         except KeyError as exc:
             return error_response(str(exc), 404)
         try:
-            neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
-            if neighborhood_size % 2 == 0:
-                neighborhood_size += 1
+            neighborhood_size = 3  # 固定 3×3
             conf_threshold = float(request.form.get("confThreshold", "0.95"))
             conf_threshold = max(0.50, min(0.99, conf_threshold))
-            train_band_keys = request.form.getlist("trainBandPaths")
         except (ValueError, TypeError) as exc:
             return error_response(str(exc), 400)
 
@@ -667,10 +658,7 @@ def create_app() -> Flask:
                     yield sse("error", {"message": "全局模型尚未训练，请先在持续训练面板中进行全局训练。"})
                     return
                 yield sse("progress", {"pct": 5, "message": "已加载全局模型，正在构建特征矩阵…"})
-                if train_band_keys:
-                    train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
-                else:
-                    train_band_paths = session.band_paths
+                train_band_paths = get_train_band_paths(session)
                 need_rebuild = (
                     session.feature_stack is None
                     or session.feature_neighborhood_size != neighborhood_size
@@ -678,8 +666,9 @@ def create_app() -> Flask:
                 )
                 if need_rebuild:
                     feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
-                    if neighborhood_size > 1:
-                        feat_stack = add_texture_features(feat_stack, neighborhood_size)
+                    # 在原始波段上排除「全波段值相同」或「全为 nodata/零」的边界像素
+                    feat_valid_mask &= (np.ptp(feat_stack, axis=-1) != 0)
+                    feat_stack = add_texture_features(feat_stack, neighborhood_size)
                     session.feature_band_paths = train_band_paths
                     session.feature_stack = feat_stack
                     session.feature_valid_mask = feat_valid_mask
@@ -934,6 +923,21 @@ def pick_default_band_keys(bands: List[Dict[str, object]]) -> List[str]:
     return [band["key"] for band in bands[:3] if isinstance(band.get("key"), str)]
 
 
+EXCLUDED_BAND_NUMBERS = {1, 3}  # 固定排除 B1 和 B3
+
+
+def get_train_band_paths(session) -> List[Path]:
+    """返回当前会话中排除 B1/B3 后的训练波段路径列表。"""
+    result = []
+    for bp in session.band_paths:
+        num = extract_band_number(bp.name)
+        if num in EXCLUDED_BAND_NUMBERS:
+            continue
+        result.append(bp)
+    # 若过滤后为空（罕见情况），退回到全部波段
+    return result if result else list(session.band_paths)
+
+
 def resolve_band_path(scene_dir: Path, band_value: str) -> Path:
     band_value = (band_value or "").strip()
     if not band_value:
@@ -969,7 +973,7 @@ def build_feature_stack(band_paths: List[Path], target_shape: Optional[Tuple[int
 
 
 def add_texture_features(stack: np.ndarray, neighborhood_size: int) -> np.ndarray:
-    """对每个波段计算邻域均值和标准差，拼接为纹理特征。"""
+    """对每个波段计算邻域均值和标准差，仅返回均值+标准差（不含原始值）。"""
     n_bands = stack.shape[-1]
     mean_layers = np.empty_like(stack)
     std_layers = np.empty_like(stack)
@@ -979,7 +983,7 @@ def add_texture_features(stack: np.ndarray, neighborhood_size: int) -> np.ndarra
         mean_sq = uniform_filter(ch * ch, size=neighborhood_size, mode="reflect")
         mean_layers[..., i] = mean
         std_layers[..., i] = np.sqrt(np.maximum(0.0, mean_sq - mean * mean))
-    return np.concatenate([stack, mean_layers, std_layers], axis=-1)
+    return np.concatenate([mean_layers, std_layers], axis=-1)
 
 
 def build_stack_and_preview(band_paths: List[Path]) -> Tuple[np.ndarray, np.ndarray, bytes]:

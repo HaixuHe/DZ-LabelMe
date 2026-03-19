@@ -83,17 +83,14 @@
                 <div class="section-title-row">
                     <h2>AI 推理</h2>
                 </div>
-                <label class="field">
-                    <span>训练特征波段（Ctrl/Cmd+单击多选，留空则使用当前预览三波段）</span>
+                <label class="field" style="display:none">
+                    <span>训练特征波段</span>
                     <select id="trainBandsSelect" multiple size="6"></select>
                 </label>
-                <label class="field">
+                <label class="field" style="display:none">
                     <span>纹理特征邻域大小</span>
                     <select id="neighborhoodSizeSelect">
-                        <option value="1">不加入纹理（1×1 单像素）</option>
-                        <option value="3" selected>3×3 邻域（均值 + 标准差）</option>
-                        <option value="5">5×5 邻域（均值 + 标准差）</option>
-                        <option value="7">7×7 邻域（均值 + 标准差）</option>
+                        <option value="3" selected>3×3</option>
                     </select>
                 </label>
                 <div class="train-grid">

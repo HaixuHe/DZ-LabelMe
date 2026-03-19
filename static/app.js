@@ -740,12 +740,8 @@ async function saveToPool() {
     try {
         const formData = new FormData();
         formData.append("mask", await maskToBlob(state.labelMask), "labels.png");
-        formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
-        const selectedBands = [...elements.trainBandsSelect.selectedOptions].map(opt => opt.value);
-        for (const key of selectedBands) {
-            formData.append("trainBandPaths", key);
-        }
-        const data = await fetchJson(`/api/sessions/${state.sessionId}/save-samples`, {
+        const data = await fetchJson(`/api/sessions/${state.sessionId}/save-samples`,
+ {
             method: "POST",
             body: formData
         });
@@ -917,12 +913,7 @@ async function globalInfer() {
     elements.globalInferProgressLabel.textContent = "准备中…";
     try {
         const formData = new FormData();
-        formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
         formData.append("confThreshold", elements.confThresholdInput.value || "0.95");
-        const selectedBands = [...elements.trainBandsSelect.selectedOptions].map(opt => opt.value);
-        for (const key of selectedBands) {
-            formData.append("trainBandPaths", key);
-        }
         const response = await fetch(`/api/sessions/${state.sessionId}/global-infer`, {
             method: "POST",
             body: formData
@@ -1047,13 +1038,9 @@ async function trainModel() {
         formData.append("maxDepth", elements.maxDepthInput.value || "18");
         formData.append("maxSamplesPerClass", elements.maxSamplesInput.value || "15000");
         formData.append("confThreshold", elements.confThresholdInput.value || "0.95");
-        formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
-        const selectedBands = [...elements.trainBandsSelect.selectedOptions].map((opt) => opt.value);
-        for (const key of selectedBands) {
-            formData.append("trainBandPaths", key);
-        }
 
-        const response = await fetch(`/api/sessions/${state.sessionId}/train`, {
+        const response = await fetch(`/api/sessions/${state.sessionId}/train`,
+ {
             method: "POST",
             body: formData
         });
