@@ -80,6 +80,26 @@ def create_app() -> Flask:
         except ValueError as exc:
             return error_response(str(exc), 400)
 
+    @app.post("/api/list-subfolders")
+    def api_list_subfolders():
+        """列出父文件夹下所有包含 TIF 波段文件的直接子文件夹，按名称排序。"""
+        payload = request.get_json(silent=True) or {}
+        parent_path = payload.get("parentPath", "")
+        try:
+            parent = normalize_folder_path(parent_path)
+            subfolders = sorted(
+                [str(item) for item in parent.iterdir()
+                 if item.is_dir() and count_band_candidates(item) > 0],
+                key=lambda p: Path(p).name.upper()
+            )
+            return jsonify({
+                "subfolders": subfolders,
+                "count": len(subfolders),
+                "parentPath": str(parent)
+            })
+        except ValueError as exc:
+            return error_response(str(exc), 400)
+
     @app.post("/api/load-scene")
     def api_load_scene():
         payload = request.get_json(silent=True) or {}
@@ -464,7 +484,7 @@ def extract_band_number(filename: str) -> Optional[int]:
 
 
 def pick_default_band_keys(bands: List[Dict[str, object]]) -> List[str]:
-    preferred_orders = ([3, 2, 1], [4, 3, 2], [9, 8, 7])
+    preferred_orders = ([14, 7, 5], [3, 2, 1], [4, 3, 2], [9, 8, 7])
     by_band: Dict[int, str] = {}
     for band in bands:
         band_number = band.get("bandNumber")

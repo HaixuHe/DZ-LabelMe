@@ -47,7 +47,12 @@ const elements = {
     canvasStack: document.getElementById("canvasStack"),
     imageCanvas: document.getElementById("imageCanvas"),
     predictionCanvas: document.getElementById("predictionCanvas"),
-    labelCanvas: document.getElementById("labelCanvas")
+    labelCanvas: document.getElementById("labelCanvas"),
+    scanBatchBtn: document.getElementById("scanBatchBtn"),
+    folderNavRow: document.getElementById("folderNavRow"),
+    folderNavInfo: document.getElementById("folderNavInfo"),
+    prevFolderBtn: document.getElementById("prevFolderBtn"),
+    nextFolderBtn: document.getElementById("nextFolderBtn")
 };
 
 const imageContext = elements.imageCanvas.getContext("2d");
@@ -88,7 +93,10 @@ const state = {
     lastPoint: null,
     isBusy: false,
     isInferring: false,
-    predictionTifUrl: null
+    predictionTifUrl: null,
+    folderQueue: [],
+    currentFolderIndex: -1,
+    labelsDirty: false
 };
 
 // 平移状态：fromPointer=true 表示空格+左键（canvas capture），false 表示中键（window mouse）
@@ -149,6 +157,7 @@ function setBusy(busy, message) {
     if (message) {
         setStatus(message, busy ? "busy" : "");
     }
+    updateFolderNavUI();
 }
 
 function setInferring(active) {
@@ -221,6 +230,44 @@ function updateSceneInfo(scene) {
 }
 
 
+
+// 点击"扫描"时的智能入口：优先批量模式，否则直接扫描并加载
+async function handleScanClick() {
+    const targetPath = (elements.folderPathInput.value || "").trim();
+    if (!targetPath) {
+        setStatus("请先输入文件夹路径", "error");
+        return;
+    }
+
+    setBusy(true, "正在检测子文件夹…");
+    let batchPayload;
+    try {
+        batchPayload = await fetchJson("/api/list-subfolders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parentPath: targetPath })
+        });
+    } catch (err) {
+        setStatus(err.message, "error");
+        setBusy(false);
+        return;
+    }
+    setBusy(false);
+
+    if (batchPayload.subfolders && batchPayload.subfolders.length > 0) {
+        // 批量模式：扫到子文件夹，加载第一个
+        state.folderQueue = batchPayload.subfolders;
+        state.currentFolderIndex = -1;
+        updateFolderNavUI();
+        await navigateToFolder(0);
+    } else {
+        // 单文件夹模式：直接扫描波段并加载影像
+        await scanFolder(targetPath);
+        if (state.sceneBands.length >= 3) {
+            await loadScene();
+        }
+    }
+}
 
 async function scanFolder(folderPath) {
     const targetPath = (folderPath || elements.folderPathInput.value || "").trim();
@@ -508,6 +555,7 @@ function paintStroke(fromX, fromY, toX, toY) {
     }
 
     if (changed) {
+        state.labelsDirty = true;
         updateOverlayPatch(minX, minY, maxX, maxY);
     }
 }
@@ -631,6 +679,7 @@ async function loadScene() {
         }
         state.labelMask = createEmptyMask();
         state.predictionMask = null;
+        state.labelsDirty = false;
         labelImageData.data = null;
         predictionImageData.data = null;
         fitView();
@@ -801,6 +850,7 @@ function copyPredictionToEditableLayer() {
     for (let i = 0; i < state.predictionMask.length; i++) {
         state.labelMask[i] = state.predictionMask[i] === 99 ? 0 : state.predictionMask[i];
     }
+    state.labelsDirty = true;
     // 重置 AI 推理状态，进入全新标注/训练流程
     state.predictionMask = null;
     state.predictionTifUrl = null;
@@ -809,6 +859,69 @@ function copyPredictionToEditableLayer() {
     elements.copyPredictionBtn.disabled = true;
     rebuildLabelLayer();
     setStatus("AI 结果已复制到可编辑层，已重置推理状态，可重新训练", "success");
+}
+
+// ── 文件夹批量导航 ────────────────────────────────────────────
+
+function updateFolderNavUI() {
+    if (!elements.folderNavRow) { return; }
+    if (state.folderQueue.length === 0) {
+        elements.folderNavRow.classList.add("hidden");
+        return;
+    }
+    elements.folderNavRow.classList.remove("hidden");
+    const idx = state.currentFolderIndex;
+    const total = state.folderQueue.length;
+    const name = idx >= 0 ? state.folderQueue[idx].split(/[\\/]/).pop() : "—";
+    const pos = idx >= 0 ? `${idx + 1}/${total}` : `—/${total}`;
+    elements.folderNavInfo.textContent = `${pos}  ${name}`;
+    elements.prevFolderBtn.disabled = state.isBusy || idx <= 0;
+    elements.nextFolderBtn.disabled = state.isBusy || idx >= total - 1;
+}
+
+async function scanBatchFolders() {
+    const parentPath = (elements.folderPathInput.value || "").trim();
+    if (!parentPath) {
+        setStatus("请先输入父文件夹路径", "error");
+        return;
+    }
+    setBusy(true, "正在扫描 DZV01 子文件夹…");
+    try {
+        const payload = await fetchJson("/api/list-subfolders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parentPath })
+        });
+        if (!payload.subfolders || payload.subfolders.length === 0) {
+            throw new Error("当前文件夹下没有找到包含波段数据的子文件夹");
+        }
+        state.folderQueue = payload.subfolders;
+        state.currentFolderIndex = -1;
+        updateFolderNavUI();
+        setStatus(`已找到 ${payload.count} 个 DZV01 场景，点击"下一张"开始加载`, "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    } finally {
+        setBusy(false);
+    }
+}
+
+async function navigateToFolder(targetIndex) {
+    if (targetIndex < 0 || targetIndex >= state.folderQueue.length) { return; }
+    if (state.labelsDirty) {
+        if (!confirm("当前有未导出的标注，切换后将丢失，是否继续？")) {
+            return;
+        }
+    }
+    const folderPath = state.folderQueue[targetIndex];
+    const parentPath = elements.folderPathInput.value;  // 保存父文件夹路径，scanFolder 会把它覆盖
+    await scanFolder(folderPath);
+    elements.folderPathInput.value = parentPath;         // 恢复父文件夹路径
+    if (state.sceneBands.length >= 3) {
+        await loadScene();
+        state.currentFolderIndex = targetIndex;
+    }
+    updateFolderNavUI();
 }
 
 function downloadMask(mask, filename) {
@@ -1047,7 +1160,9 @@ function handleWheel(event) {
 }
 
 function bindEvents() {
-    elements.scanFolderBtn.addEventListener("click", () => scanFolder(elements.folderPathInput.value));
+    elements.scanFolderBtn.addEventListener("click", handleScanClick);
+    elements.prevFolderBtn.addEventListener("click", () => navigateToFolder(state.currentFolderIndex - 1));
+    elements.nextFolderBtn.addEventListener("click", () => navigateToFolder(state.currentFolderIndex + 1));
     elements.loadSceneBtn.addEventListener("click", loadScene);
     elements.addClassBtn.addEventListener("click", addClass);
     elements.brushToolBtn.addEventListener("click", () => {
@@ -1092,6 +1207,7 @@ function bindEvents() {
             anchor.download = "labels.tif";
             anchor.click();
             URL.revokeObjectURL(anchor.href);
+            state.labelsDirty = false;
             setStatus("标注 TIF 导出成功", "success");
         } catch (error) {
             setStatus(error.message, "error");
@@ -1177,6 +1293,7 @@ function initialize() {
     elements.copyPredictionBtn.disabled = true;
     elements.downloadLabelsBtn.disabled = true;
     elements.folderPathInput.value = window.APP_CONFIG.workspaceRoot || "";
+    updateFolderNavUI();
 }
 
 initialize();

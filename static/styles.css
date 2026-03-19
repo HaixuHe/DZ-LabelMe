@@ -537,6 +537,36 @@ input[type="color"] {
     z-index: 10;
 }
 
+/* ── 文件夹批量导航 ─────────────────────────────────────── */
+.folder-nav-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    margin-bottom: 4px;
+}
+
+.folder-nav-row.hidden {
+    display: none;
+}
+
+.folder-nav-info {
+    font-size: 12px;
+    color: var(--muted);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.folder-nav-btns {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
 @media (max-width: 1200px) {
     body {
         height: auto;
