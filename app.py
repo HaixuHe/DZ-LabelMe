@@ -6,6 +6,9 @@ import os
 import re
 import uuid
 import warnings
+from datetime import datetime
+
+import joblib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
@@ -33,6 +36,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_CLASS_COLORS = ["#ff6b4a", "#1f8a70", "#2b59c3", "#c77d20", "#8f2d56"]
 BAND_PATTERN = re.compile(r"_B(\d+)", re.IGNORECASE)
 
+TRAINING_POOL_DIR = OUTPUT_DIR / "training_pool"
+GLOBAL_MODEL_PATH = OUTPUT_DIR / "global_model.pkl"
+GLOBAL_MODEL_META_PATH = OUTPUT_DIR / "global_model_meta.json"
+
 
 @dataclass
 class SessionState:
@@ -55,6 +62,9 @@ class SessionState:
 
 SESSIONS: Dict[str, SessionState] = {}
 SESSION_ORDER: List[str] = []
+
+_global_model_cache: Optional[RandomForestClassifier] = None
+_global_model_cache_mtime: float = 0.0
 
 
 def create_app() -> Flask:
@@ -262,9 +272,6 @@ def create_app() -> Flask:
                 if labeled_pixels == 0:
                     yield sse("error", {"message": "至少需要标注一些像素后才能训练。"})
                     return
-                if labeled_classes.size < 2:
-                    yield sse("error", {"message": "随机森林至少需要 2 个类别才能训练。"})
-                    return
 
                 # ── 步骤 1：构建/复用特征栈 ─────────────────────────────
                 yield sse("progress", {"step": "feature", "pct": 0, "message": "正在构建特征矩阵…"})
@@ -306,23 +313,29 @@ def create_app() -> Flask:
                 train_features = train_features[valid_sample_mask]
                 train_labels = train_labels[valid_sample_mask]
 
-                if np.unique(train_labels).size < 2:
+                if train_features.shape[0] == 0:
                     yield sse("error", {"message": "有效训练样本不足，可能全部落在无效像素上。"})
                     return
 
-                yield sse("progress", {"step": "train", "pct": 35, "message": "正在训练随机森林…"})
-                model = RandomForestClassifier(
-                    n_estimators=n_estimators,
-                    max_depth=max_depth,
-                    random_state=42,
-                    n_jobs=-1,
-                    max_features=None,
-                    class_weight="balanced_subsample",
-                    bootstrap=True,
-                    oob_score=n_estimators >= 50,
-                )
-                model.fit(train_features, train_labels)
-                yield sse("progress", {"step": "train", "pct": 60, "message": "训练完成，开始全图推理…"})
+                yield sse("progress", {"step": "train", "pct": 35, "message": "正在训练模型…"})
+                if np.unique(train_labels).size < 2:
+                    from sklearn.dummy import DummyClassifier
+                    model = DummyClassifier(strategy="most_frequent")
+                    model.fit(train_features, train_labels)
+                    yield sse("progress", {"step": "train", "pct": 60, "message": "单类影像，使用常量预测…"})
+                else:
+                    model = RandomForestClassifier(
+                        n_estimators=n_estimators,
+                        max_depth=max_depth,
+                        random_state=42,
+                        n_jobs=-1,
+                        max_features=None,
+                        class_weight="balanced_subsample",
+                        bootstrap=True,
+                        oob_score=n_estimators >= 50,
+                    )
+                    model.fit(train_features, train_labels)
+                    yield sse("progress", {"step": "train", "pct": 60, "message": "训练完成，开始全图推理…"})
 
                 # ── 步骤 3：分批推理（带进度） ───────────────────────────
                 flat_features = feature_stack.reshape(-1, feature_stack.shape[-1])
@@ -395,7 +408,431 @@ def create_app() -> Flask:
         return Response(generate(), mimetype="text/event-stream",
                         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
+    # ──────────── 持续训练：保存样本到训练池 ────────────────────────
+    @app.post("/api/sessions/<session_id>/save-samples")
+    def api_save_samples(session_id: str):
+        try:
+            session = get_session(session_id)
+        except KeyError as exc:
+            return error_response(str(exc), 404)
+        if "mask" not in request.files:
+            return error_response("缺少标注掩膜。", 400)
+        try:
+            mask_bytes = request.files["mask"].read()
+            neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
+            if neighborhood_size % 2 == 0:
+                neighborhood_size += 1
+            train_band_keys = request.form.getlist("trainBandPaths")
+        except ValueError as exc:
+            return error_response(str(exc), 400)
+        try:
+            buf = io.BytesIO(mask_bytes)
+            label_mask = parse_uploaded_mask_bytes(buf, session.valid_mask.shape)
+        except Exception as exc:
+            return error_response(f"解析标注掩膜失败：{exc}", 500)
+        labeled_pixels = int((label_mask > 0).sum())
+        if labeled_pixels == 0:
+            return error_response("当前没有任何标注像素，无法保存到训练池。", 400)
+        try:
+            if train_band_keys:
+                train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
+            else:
+                train_band_paths = session.band_paths
+            need_rebuild = (
+                session.feature_stack is None
+                or session.feature_neighborhood_size != neighborhood_size
+                or [str(p) for p in (session.feature_band_paths or [])] != [str(p) for p in train_band_paths]
+            )
+            if need_rebuild:
+                feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
+                if neighborhood_size > 1:
+                    feat_stack = add_texture_features(feat_stack, neighborhood_size)
+                session.feature_band_paths = train_band_paths
+                session.feature_stack = feat_stack
+                session.feature_valid_mask = feat_valid_mask
+                session.feature_neighborhood_size = neighborhood_size
+                session.train_reference_band = train_band_paths[0]
+            feature_stack = session.feature_stack
+            flat_mask = label_mask.reshape(-1)
+            flat_features = feature_stack.reshape(-1, feature_stack.shape[-1])
+            labeled_indices = np.flatnonzero(flat_mask > 0)
+            features = flat_features[labeled_indices].astype(np.float32)
+            labels = flat_mask[labeled_indices].astype(np.uint8)
+            keep = np.all(np.isfinite(features), axis=1) & (np.ptp(features, axis=1) != 0)
+            features = features[keep]
+            labels = labels[keep]
+            if features.shape[0] == 0:
+                return error_response("过滤后没有有效训练样本。", 400)
+            # 每个类别最多随机保留 MAX_SAMPLES_PER_CLASS 个样本，避免单张影像样本过多
+            MAX_SAMPLES_PER_CLASS = 10000
+            rng = np.random.default_rng(42)
+            selected = []
+            for cls in np.unique(labels):
+                idx = np.flatnonzero(labels == cls)
+                if len(idx) > MAX_SAMPLES_PER_CLASS:
+                    idx = rng.choice(idx, MAX_SAMPLES_PER_CLASS, replace=False)
+                selected.append(idx)
+            sel_idx = np.concatenate(selected)
+            rng.shuffle(sel_idx)
+            features = features[sel_idx]
+            labels = labels[sel_idx]
+        except Exception as exc:
+            return error_response(f"特征提取失败：{exc}", 500)
+        try:
+            TRAINING_POOL_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            stem = f"{session.scene_dir.name}_{timestamp}"
+            np.savez_compressed(str(TRAINING_POOL_DIR / f"{stem}.npz"), features=features, labels=labels)
+            distribution = count_labels(label_mask)
+            meta = {
+                "sceneName": session.scene_dir.name,
+                "folderPath": str(session.scene_dir),
+                "timestamp": timestamp,
+                "sampleCount": int(features.shape[0]),
+                "featureDim": int(features.shape[1]),
+                "neighborhoodSize": neighborhood_size,
+                "bandCount": len(train_band_paths),
+                "classDistribution": distribution,
+                "bandKeys": [p.relative_to(session.scene_dir).as_posix() for p in train_band_paths],
+            }
+            with open(TRAINING_POOL_DIR / f"{stem}.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            return error_response(f"写入训练池失败：{exc}", 500)
+        return jsonify({
+            "saved": True,
+            "filename": stem,
+            "sampleCount": int(features.shape[0]),
+            "classDistribution": distribution,
+            "poolSummary": get_training_pool_summary(),
+        })
+
+    # ──────────── 持续训练：查询训练池状态 ──────────────────────────
+    @app.get("/api/training-pool")
+    def api_training_pool():
+        return jsonify(get_training_pool_summary())
+
+    # ──────────── 持续训练：删除训练池条目 ──────────────────────────
+    @app.delete("/api/training-pool/<stem>")
+    def api_delete_pool_file(stem: str):
+        if not re.match(r"^[A-Za-z0-9_\-]+$", stem):
+            return error_response("无效的文件名。", 400)
+        deleted = []
+        for suffix in (".npz", ".json"):
+            p = TRAINING_POOL_DIR / f"{stem}{suffix}"
+            if p.exists():
+                p.unlink()
+                deleted.append(p.name)
+        if not deleted:
+            return error_response("未找到指定文件。", 404)
+        return jsonify({"deleted": deleted, "poolSummary": get_training_pool_summary()})
+
+    # ──────────── 持续训练：全局模型训练（SSE）───────────────────────
+    @app.post("/api/global-train")
+    def api_global_train():
+        payload = request.get_json(silent=True) or {}
+        try:
+            n_estimators = clamp_int(str(payload.get("nEstimators", 200)), 10, 1000)
+            max_depth = parse_optional_depth(str(payload.get("maxDepth", 22)))
+            max_samples_per_class = clamp_int(str(payload.get("maxSamplesPerClass", 10000)), 50, 300000)
+        except ValueError as exc:
+            return error_response(str(exc), 400)
+
+        def generate():
+            def sse(event: str, data: dict) -> str:
+                return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            try:
+                if not TRAINING_POOL_DIR.exists():
+                    yield sse("error", {"message": "训练池为空，请先保存至少 2 张影像的标注。"})
+                    return
+                files = get_pool_files()
+                if len(files) < 2:
+                    yield sse("error", {"message": "训练池中至少需要 2 个场景的样本才能全局训练。"})
+                    return
+                dims = set(f["meta"].get("featureDim", 0) for f in files)
+                if len(dims) > 1:
+                    yield sse("error", {"message": f"训练池中特征维度不一致（{dims}），请确保所有样本使用相同的波段数和纹理邻域保存。"})
+                    return
+                feature_dim = next(iter(dims))
+                yield sse("progress", {"pct": 5, "message": f"正在加载 {len(files)} 个场景的训练样本…"})
+                rng = np.random.default_rng(42)
+                all_features_list: List[np.ndarray] = []
+                all_labels_list: List[np.ndarray] = []
+                for i, file_info in enumerate(files):
+                    npz = np.load(file_info["npz_path"])
+                    feat = npz["features"].astype(np.float32)
+                    lbl = npz["labels"].astype(np.uint8)
+                    keep_groups = []
+                    for cls_id in np.unique(lbl):
+                        idx = np.flatnonzero(lbl == cls_id)
+                        if idx.size > max_samples_per_class:
+                            idx = rng.choice(idx, size=max_samples_per_class, replace=False)
+                        keep_groups.append(idx)
+                    if keep_groups:
+                        keep_idx = np.concatenate(keep_groups)
+                        all_features_list.append(feat[keep_idx])
+                        all_labels_list.append(lbl[keep_idx])
+                    pct = 5 + int((i + 1) / len(files) * 25)
+                    yield sse("progress", {"pct": pct, "message": f"已加载 {i + 1}/{len(files)} 个场景"})
+                if not all_features_list:
+                    yield sse("error", {"message": "未能读取任何有效样本。"})
+                    return
+                all_features = np.concatenate(all_features_list, axis=0)
+                all_labels = np.concatenate(all_labels_list, axis=0)
+                shuffle_idx = rng.permutation(all_features.shape[0])
+                all_features = all_features[shuffle_idx]
+                all_labels = all_labels[shuffle_idx]
+                yield sse("progress", {"pct": 32, "message": f"共 {all_features.shape[0]:,} 个样本，开始训练模型…"})
+                if np.unique(all_labels).size < 2:
+                    from sklearn.dummy import DummyClassifier
+                    model = DummyClassifier(strategy="most_frequent")
+                    model.fit(all_features, all_labels)
+                    train_accuracy = 1.0
+                    oob_score = None
+                else:
+                    model = RandomForestClassifier(
+                        n_estimators=n_estimators,
+                        max_depth=max_depth,
+                        random_state=42,
+                        n_jobs=-1,
+                        max_features=None,
+                        class_weight="balanced_subsample",
+                        bootstrap=True,
+                        oob_score=n_estimators >= 50,
+                    )
+                    model.fit(all_features, all_labels)
+                    train_accuracy = float(model.score(all_features, all_labels))
+                    oob_score = float(model.oob_score_) if hasattr(model, "oob_score_") else None
+                yield sse("progress", {"pct": 80, "message": "训练完成，正在保存全局模型…"})
+                OUTPUT_DIR.mkdir(exist_ok=True)
+                joblib.dump(model, GLOBAL_MODEL_PATH)
+                global _global_model_cache, _global_model_cache_mtime
+                _global_model_cache = model
+                _global_model_cache_mtime = GLOBAL_MODEL_PATH.stat().st_mtime
+                class_dist = [
+                    {"classId": int(c), "count": int((all_labels == c).sum())}
+                    for c in np.unique(all_labels)
+                ]
+                meta = {
+                    "trainedAt": datetime.now().isoformat(timespec="seconds"),
+                    "nEstimators": n_estimators,
+                    "maxDepth": max_depth,
+                    "totalSamples": int(all_features.shape[0]),
+                    "featureDim": feature_dim,
+                    "nFiles": len(files),
+                    "scenes": [f["meta"].get("sceneName", "") for f in files],
+                    "trainAccuracy": round(train_accuracy, 4),
+                    "oobScore": round(oob_score, 4) if oob_score is not None else None,
+                    "classes": [int(c) for c in np.unique(all_labels).tolist()],
+                    "classDistribution": class_dist,
+                }
+                with open(GLOBAL_MODEL_META_PATH, "w", encoding="utf-8") as fp:
+                    json.dump(meta, fp, ensure_ascii=False, indent=2)
+                yield sse("progress", {"pct": 100, "message": "全局模型已保存"})
+                yield sse("result", {
+                    "message": f"全局模型训练完成：{len(files)} 个场景，{all_features.shape[0]:,} 个样本",
+                    "meta": meta,
+                })
+            except Exception as exc:
+                yield sse("error", {"message": f"全局训练失败：{exc}"})
+
+        return Response(generate(), mimetype="text/event-stream",
+                        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+    # ──────────── 持续训练：全局模型推理（SSE）───────────────────────
+    @app.post("/api/sessions/<session_id>/global-infer")
+    def api_global_infer(session_id: str):
+        try:
+            session = get_session(session_id)
+        except KeyError as exc:
+            return error_response(str(exc), 404)
+        try:
+            neighborhood_size = clamp_int(request.form.get("neighborhoodSize", "1"), 1, 11)
+            if neighborhood_size % 2 == 0:
+                neighborhood_size += 1
+            conf_threshold = float(request.form.get("confThreshold", "0.95"))
+            conf_threshold = max(0.50, min(0.99, conf_threshold))
+            train_band_keys = request.form.getlist("trainBandPaths")
+        except (ValueError, TypeError) as exc:
+            return error_response(str(exc), 400)
+
+        def generate():
+            def sse(event: str, data: dict) -> str:
+                return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            try:
+                model, model_meta = load_global_model()
+                if model is None:
+                    yield sse("error", {"message": "全局模型尚未训练，请先在持续训练面板中进行全局训练。"})
+                    return
+                yield sse("progress", {"pct": 5, "message": "已加载全局模型，正在构建特征矩阵…"})
+                if train_band_keys:
+                    train_band_paths = [resolve_band_path(session.scene_dir, key) for key in train_band_keys]
+                else:
+                    train_band_paths = session.band_paths
+                need_rebuild = (
+                    session.feature_stack is None
+                    or session.feature_neighborhood_size != neighborhood_size
+                    or [str(p) for p in (session.feature_band_paths or [])] != [str(p) for p in train_band_paths]
+                )
+                if need_rebuild:
+                    feat_stack, feat_valid_mask = build_feature_stack(train_band_paths, session.valid_mask.shape)
+                    if neighborhood_size > 1:
+                        feat_stack = add_texture_features(feat_stack, neighborhood_size)
+                    session.feature_band_paths = train_band_paths
+                    session.feature_stack = feat_stack
+                    session.feature_valid_mask = feat_valid_mask
+                    session.feature_neighborhood_size = neighborhood_size
+                    session.train_reference_band = train_band_paths[0]
+                feature_stack = session.feature_stack
+                feature_valid_mask = session.feature_valid_mask
+                expected_dim = model_meta.get("featureDim") if model_meta else None
+                actual_dim = feature_stack.shape[-1]
+                if expected_dim is not None and actual_dim != expected_dim:
+                    yield sse("error", {
+                        "message": (
+                            f"特征维度不匹配：全局模型期望 {expected_dim} 维，"
+                            f"当前场景为 {actual_dim} 维。"
+                            f"请使用相同的波段数量和纹理邻域大小。"
+                        )
+                    })
+                    return
+                yield sse("progress", {"pct": 20, "message": "特征矩阵就绪，开始全图推理…"})
+                flat_features = feature_stack.reshape(-1, feature_stack.shape[-1])
+                n_pixels = flat_features.shape[0]
+                flat_prediction = np.full(n_pixels, 99, dtype=np.uint8)
+                flat_confidence = np.zeros(n_pixels, dtype=np.float32)
+                valid_indices = np.flatnonzero(feature_valid_mask.reshape(-1))
+                _vf = flat_features[valid_indices]
+                _all_same = np.ptp(_vf, axis=1) == 0
+                infer_indices = valid_indices[~_all_same]
+                del _vf, _all_same
+                total_valid = infer_indices.size
+                done = 0
+                for start in range(0, total_valid, PREDICT_BATCH_SIZE):
+                    end = start + PREDICT_BATCH_SIZE
+                    batch_indices = infer_indices[start:end]
+                    batch_proba = model.predict_proba(flat_features[batch_indices])
+                    flat_prediction[batch_indices] = model.classes_[
+                        batch_proba.argmax(axis=1)].astype(np.uint8)
+                    flat_confidence[batch_indices] = batch_proba.max(axis=1)
+                    done += len(batch_indices)
+                    pct = 20 + int(done / max(total_valid, 1) * 65)
+                    yield sse("progress", {"pct": pct, "message": f"推理中… {done}/{total_valid} 像素"})
+                yield sse("progress", {"pct": 87, "message": "应用置信度与均质性过滤…"})
+                pred_2d = flat_prediction.reshape(feature_valid_mask.shape)
+                conf_2d = flat_confidence.reshape(feature_valid_mask.shape)
+                conf_ok = conf_2d >= conf_threshold
+                homogeneous = np.zeros(pred_2d.shape, dtype=bool)
+                for cls in np.unique(pred_2d):
+                    if cls == 99:
+                        continue
+                    same = (pred_2d == cls).view(np.uint8)
+                    homogeneous |= minimum_filter(same, size=20, mode="constant", cval=0).astype(bool)
+                prediction_mask = pred_2d.copy()
+                prediction_mask[~(conf_ok & homogeneous)] = 99
+                session.prediction_mask = prediction_mask
+                session.prediction_png = encode_mask_png(prediction_mask)
+                prediction_distribution = count_labels(prediction_mask)
+                yield sse("progress", {"pct": 100, "message": "全局推理完成"})
+                yield sse("result", {
+                    "message": "全局模型推理完成，可继续细化标注后重新迭代。",
+                    "predictionUrl": f"/api/sessions/{session_id}/prediction.png?ts={uuid.uuid4().hex}",
+                    "predictionTifUrl": f"/api/sessions/{session_id}/prediction.tif",
+                    "predictionDistribution": prediction_distribution,
+                })
+            except Exception as exc:
+                yield sse("error", {"message": f"全局推理失败：{exc}"})
+
+        return Response(generate(), mimetype="text/event-stream",
+                        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
     return app
+
+
+def get_pool_files() -> List[Dict]:
+    """返回训练池中所有样本文件信息列表。"""
+    if not TRAINING_POOL_DIR.exists():
+        return []
+    result = []
+    for npz_path in sorted(TRAINING_POOL_DIR.glob("*.npz")):
+        stem = npz_path.stem
+        json_path = npz_path.with_suffix(".json")
+        meta: Dict = {}
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception:
+                pass
+        result.append({"stem": stem, "npz_path": str(npz_path), "meta": meta})
+    return result
+
+
+def get_training_pool_summary() -> Dict:
+    """返回训练池摘要信息。"""
+    files = get_pool_files()
+    total_samples = sum(f["meta"].get("sampleCount", 0) for f in files)
+    files_info = [
+        {
+            "stem": f["stem"],
+            "sceneName": f["meta"].get("sceneName", f["stem"]),
+            "timestamp": f["meta"].get("timestamp", ""),
+            "sampleCount": f["meta"].get("sampleCount", 0),
+            "featureDim": f["meta"].get("featureDim", 0),
+            "neighborhoodSize": f["meta"].get("neighborhoodSize", 1),
+            "bandCount": f["meta"].get("bandCount", 0),
+            "classDistribution": f["meta"].get("classDistribution", []),
+        }
+        for f in files
+    ]
+    global_model_meta = None
+    if GLOBAL_MODEL_META_PATH.exists():
+        try:
+            with open(GLOBAL_MODEL_META_PATH, "r", encoding="utf-8") as fp:
+                global_model_meta = json.load(fp)
+        except Exception:
+            pass
+    return {
+        "fileCount": len(files),
+        "totalSamples": total_samples,
+        "files": files_info,
+        "globalModelExists": GLOBAL_MODEL_PATH.exists(),
+        "globalModelMeta": global_model_meta,
+    }
+
+
+def load_global_model() -> Tuple[Optional[RandomForestClassifier], Optional[Dict]]:
+    """从磁盘加载全局模型（有内存缓存）。"""
+    global _global_model_cache, _global_model_cache_mtime
+    if not GLOBAL_MODEL_PATH.exists():
+        _global_model_cache = None
+        return None, None
+    mtime = GLOBAL_MODEL_PATH.stat().st_mtime
+    if _global_model_cache is not None and mtime == _global_model_cache_mtime:
+        meta = None
+        if GLOBAL_MODEL_META_PATH.exists():
+            try:
+                with open(GLOBAL_MODEL_META_PATH, "r", encoding="utf-8") as fp:
+                    meta = json.load(fp)
+            except Exception:
+                pass
+        return _global_model_cache, meta
+    try:
+        _global_model_cache = joblib.load(GLOBAL_MODEL_PATH)
+        _global_model_cache_mtime = mtime
+        meta = None
+        if GLOBAL_MODEL_META_PATH.exists():
+            try:
+                with open(GLOBAL_MODEL_META_PATH, "r", encoding="utf-8") as fp:
+                    meta = json.load(fp)
+            except Exception:
+                pass
+        return _global_model_cache, meta
+    except Exception:
+        _global_model_cache = None
+        return None, None
 
 
 def error_response(message: str, status_code: int):

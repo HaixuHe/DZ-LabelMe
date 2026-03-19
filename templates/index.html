@@ -59,7 +59,7 @@
                     </div>
                 </div>
                 <div id="classList" class="class-list"></div>
-                <div class="new-class-row">
+                <div class="new-class-row" style="display:none">
                     <input id="newClassName" type="text" maxlength="32" placeholder="新类别名称">
                     <input id="newClassColor" type="color" value="#c77d20">
                     <button id="addClassBtn" class="ghost">添加</button>
@@ -133,6 +133,50 @@
                     <button id="downloadLabelsBtn" class="ghost">导出当前标注</button>
                 </div>
                 <div id="trainStats" class="info-card muted">推理结果会显示在这里。</div>
+            </section>
+
+            <section class="panel">
+                <div class="section-title-row">
+                    <h2>持续训练</h2>
+                </div>
+                <p class="hint">完成某张影像标注后，保存至训练池积累样本。多张影像后可合并训练泛化性更强的全局模型，再用于新影像推理。</p>
+                <button id="saveToPoolBtn" class="ghost wide" disabled>保存当前标注到训练池</button>
+                <div id="poolStatusCard" class="info-card muted" style="margin-top:6px">训练池：未加载</div>
+                <div id="poolFileList" style="max-height:130px;overflow-y:auto;margin-top:4px"></div>
+
+                <div class="section-title-row" style="margin-top:12px">
+                    <h2 style="font-size:12px">全局模型训练</h2>
+                </div>
+                <div class="train-grid" style="margin-top:6px">
+                    <label class="field">
+                        <span>树数量</span>
+                        <input id="globalNEstimatorsInput" type="number" min="10" max="1000" step="10" value="200">
+                    </label>
+                    <label class="field">
+                        <span>最大深度</span>
+                        <input id="globalMaxDepthInput" type="number" min="1" max="128" step="1" value="22">
+                    </label>
+                    <label class="field wide-field">
+                        <span>每类每场景采样上限</span>
+                        <input id="globalMaxSamplesInput" type="number" min="50" max="100000" step="50" value="10000">
+                    </label>
+                </div>
+                <button id="globalTrainBtn" class="accent wide" style="margin-top:4px">合并训练全局模型</button>
+                <div id="globalTrainProgressWrap" class="progress-wrap hidden">
+                    <div class="progress-bar-bg">
+                        <div id="globalTrainProgressBar" class="progress-bar-fill" style="width:0%"></div>
+                    </div>
+                    <span id="globalTrainProgressLabel" class="progress-label">准备中…</span>
+                </div>
+
+                <div id="globalModelStatusCard" class="info-card muted" style="margin-top:8px">全局模型：未训练</div>
+                <button id="globalInferBtn" class="ghost wide" disabled style="margin-top:4px">用全局模型推理当前影像</button>
+                <div id="globalInferProgressWrap" class="progress-wrap hidden">
+                    <div class="progress-bar-bg">
+                        <div id="globalInferProgressBar" class="progress-bar-fill" style="width:0%"></div>
+                    </div>
+                    <span id="globalInferProgressLabel" class="progress-label">准备中…</span>
+                </div>
             </section>
         </aside>
 

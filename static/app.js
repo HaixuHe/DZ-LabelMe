@@ -52,7 +52,22 @@ const elements = {
     folderNavRow: document.getElementById("folderNavRow"),
     folderNavInfo: document.getElementById("folderNavInfo"),
     prevFolderBtn: document.getElementById("prevFolderBtn"),
-    nextFolderBtn: document.getElementById("nextFolderBtn")
+    nextFolderBtn: document.getElementById("nextFolderBtn"),
+    saveToPoolBtn: document.getElementById("saveToPoolBtn"),
+    poolStatusCard: document.getElementById("poolStatusCard"),
+    poolFileList: document.getElementById("poolFileList"),
+    globalNEstimatorsInput: document.getElementById("globalNEstimatorsInput"),
+    globalMaxDepthInput: document.getElementById("globalMaxDepthInput"),
+    globalMaxSamplesInput: document.getElementById("globalMaxSamplesInput"),
+    globalTrainBtn: document.getElementById("globalTrainBtn"),
+    globalTrainProgressWrap: document.getElementById("globalTrainProgressWrap"),
+    globalTrainProgressBar: document.getElementById("globalTrainProgressBar"),
+    globalTrainProgressLabel: document.getElementById("globalTrainProgressLabel"),
+    globalModelStatusCard: document.getElementById("globalModelStatusCard"),
+    globalInferBtn: document.getElementById("globalInferBtn"),
+    globalInferProgressWrap: document.getElementById("globalInferProgressWrap"),
+    globalInferProgressBar: document.getElementById("globalInferProgressBar"),
+    globalInferProgressLabel: document.getElementById("globalInferProgressLabel")
 };
 
 const imageContext = elements.imageCanvas.getContext("2d");
@@ -76,11 +91,10 @@ const state = {
     labelLookup: buildBlankLookup(),
     predictionLookup: buildBlankLookup(),
     classes: [
-        { id: 1, name: "类别 1", color: "#ff6b4a" },
-        { id: 2, name: "类别 2", color: "#1f8a70" },
-        { id: 3, name: "类别 3", color: "#2b59c3" }
+        { id: 1, name: "清晰地物", color: "#1f8a70" },
+        { id: 2, name: "云", color: "#e8e8ff" }
     ],
-    nextClassId: 4,
+    nextClassId: 3,
     activeClassId: 1,
     tool: "brush",
     brushSize: 6,
@@ -96,7 +110,10 @@ const state = {
     predictionTifUrl: null,
     folderQueue: [],
     currentFolderIndex: -1,
-    labelsDirty: false
+    labelsDirty: false,
+    globalModelReady: false,
+    globalModelMeta: null,
+    poolFiles: []
 };
 
 // 平移状态：fromPointer=true 表示空格+左键（canvas capture），false 表示中键（window mouse）
@@ -154,6 +171,9 @@ function setBusy(busy, message) {
     elements.trainBtn.disabled = disabled;
     elements.scanFolderBtn.disabled = disabled;
     elements.copyPredictionBtn.disabled = disabled || !state.predictionMask;
+    elements.saveToPoolBtn.disabled = disabled || !state.sessionId;
+    elements.globalTrainBtn.disabled = disabled;
+    elements.globalInferBtn.disabled = disabled || !state.sessionId || !state.globalModelReady;
     if (message) {
         setStatus(message, busy ? "busy" : "");
     }
@@ -696,11 +716,272 @@ async function loadScene() {
         ].join("");
         elements.copyPredictionBtn.disabled = true;
         elements.downloadLabelsBtn.disabled = false;
+        elements.saveToPoolBtn.disabled = false;
         setStatus("合成图已加载，可以开始逐像素标注", "success");
     } catch (error) {
         setStatus(error.message, "error");
     } finally {
         setBusy(false);
+    }
+}
+
+// ── 持续训练功能 ─────────────────────────────────────────────
+
+async function saveToPool() {
+    if (!state.sessionId || !state.labelMask) {
+        setStatus("请先加载场景并完成标注", "error");
+        return;
+    }
+    if (!hasLabelPixels()) {
+        setStatus("请先标注至少两个类别后再保存到训练池", "error");
+        return;
+    }
+    setBusy(true, "正在保存标注到训练池…");
+    try {
+        const formData = new FormData();
+        formData.append("mask", await maskToBlob(state.labelMask), "labels.png");
+        formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
+        const selectedBands = [...elements.trainBandsSelect.selectedOptions].map(opt => opt.value);
+        for (const key of selectedBands) {
+            formData.append("trainBandPaths", key);
+        }
+        const data = await fetchJson(`/api/sessions/${state.sessionId}/save-samples`, {
+            method: "POST",
+            body: formData
+        });
+        renderPoolSummary(data.poolSummary);
+        setStatus(`已保存 ${formatNumber(data.sampleCount)} 个样本到训练池`, "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    } finally {
+        setBusy(false);
+    }
+}
+
+async function refreshPoolStatus() {
+    try {
+        const data = await fetchJson("/api/training-pool");
+        renderPoolSummary(data);
+    } catch {
+        // 静默失败
+    }
+}
+
+function renderPoolSummary(summary) {
+    if (!summary) return;
+    state.poolFiles = summary.files || [];
+    const count = summary.fileCount || 0;
+    const total = summary.totalSamples || 0;
+    elements.poolStatusCard.innerHTML = `训练池：<strong>${count} 张影像</strong>，共 <strong>${formatNumber(total)}</strong> 个样本`;
+    renderPoolFiles(state.poolFiles);
+    updateGlobalModelStatus(summary.globalModelMeta);
+    state.globalModelReady = !!summary.globalModelExists;
+    elements.globalInferBtn.disabled = !state.globalModelReady || !state.sessionId;
+}
+
+function renderPoolFiles(files) {
+    elements.poolFileList.innerHTML = "";
+    if (!files || files.length === 0) {
+        elements.poolFileList.innerHTML = `<div style="font-size:11px;color:#777;padding:4px 0">暂无保存的样本</div>`;
+        return;
+    }
+    for (const file of files) {
+        const item = document.createElement("div");
+        item.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.06)";
+        const distText = (file.classDistribution || [])
+            .map(d => `C${d.classId}:${d.count}`)
+            .join(" ");
+        const nameEl = document.createElement("div");
+        nameEl.style.cssText = "flex:1;min-width:0";
+        nameEl.innerHTML = `
+            <div style="font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${file.stem}">${file.sceneName}</div>
+            <div style="font-size:10px;color:#888">${formatNumber(file.sampleCount)} 样本 · ${distText}</div>
+        `;
+        const delBtn = document.createElement("button");
+        delBtn.className = "ghost small";
+        delBtn.textContent = "删除";
+        delBtn.style.cssText = "font-size:10px;padding:2px 6px;flex-shrink:0";
+        delBtn.addEventListener("click", () => deletePoolFile(file.stem));
+        item.append(nameEl, delBtn);
+        elements.poolFileList.append(item);
+    }
+}
+
+function updateGlobalModelStatus(meta) {
+    state.globalModelMeta = meta || null;
+    state.globalModelReady = !!meta;
+    if (!meta) {
+        elements.globalModelStatusCard.innerHTML = '全局模型：<span style="color:#888">未训练</span>';
+        return;
+    }
+    const acc = meta.trainAccuracy != null ? `训练精度 ${(meta.trainAccuracy * 100).toFixed(1)}%` : "";
+    const oob = meta.oobScore != null ? ` · OOB ${(meta.oobScore * 100).toFixed(1)}%` : "";
+    elements.globalModelStatusCard.innerHTML = [
+        '全局模型：<strong style="color:#4caf50">已就绪</strong>',
+        `<div style="font-size:10px;color:#aaa;margin-top:2px">${meta.nFiles} 个场景 · ${formatNumber(meta.totalSamples)} 样本 · ${acc}${oob}</div>`,
+        `<div style="font-size:10px;color:#aaa">训练于 ${meta.trainedAt || "未知"}</div>`,
+    ].join("");
+}
+
+async function deletePoolFile(stem) {
+    if (!confirm(`确认从训练池中删除 "${stem}" 的样本？此操作不可撤销。`)) return;
+    try {
+        await fetchJson(`/api/training-pool/${encodeURIComponent(stem)}`, { method: "DELETE" });
+        await refreshPoolStatus();
+        setStatus("已从训练池中删除", "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    }
+}
+
+async function globalTrain() {
+    if ((state.poolFiles || []).length < 2) {
+        setStatus("训练池至少需要 2 张影像的标注才能全局训练", "error");
+        return;
+    }
+    setBusy(true, "正在合并多影像数据训练全局模型…");
+    elements.globalTrainProgressWrap.classList.remove("hidden");
+    elements.globalTrainProgressBar.style.width = "0%";
+    elements.globalTrainProgressLabel.textContent = "准备中…";
+    try {
+        const body = {
+            nEstimators: parseInt(elements.globalNEstimatorsInput.value || "200"),
+            maxDepth: parseInt(elements.globalMaxDepthInput.value || "22") || null,
+            maxSamplesPerClass: parseInt(elements.globalMaxSamplesInput.value || "10000"),
+        };
+        const response = await fetch("/api/global-train", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok || !response.body) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.error || `全局训练失败：${response.status}`);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split("\n\n");
+            buffer = parts.pop();
+            for (const block of parts) {
+                let eventType = "message";
+                let dataStr = "";
+                for (const line of block.split("\n")) {
+                    if (line.startsWith("event: ")) eventType = line.slice(7).trim();
+                    else if (line.startsWith("data: ")) dataStr = line.slice(6).trim();
+                }
+                if (!dataStr) continue;
+                let data;
+                try { data = JSON.parse(dataStr); } catch { continue; }
+                if (eventType === "progress") {
+                    elements.globalTrainProgressBar.style.width = `${data.pct ?? 0}%`;
+                    elements.globalTrainProgressLabel.textContent = data.message || "";
+                    setStatus(data.message || "训练中…", "busy");
+                } else if (eventType === "result") {
+                    updateGlobalModelStatus(data.meta);
+                    state.globalModelReady = true;
+                    elements.globalInferBtn.disabled = !state.sessionId;
+                    setStatus(data.message || "全局模型训练完成", "success");
+                    await refreshPoolStatus();
+                } else if (eventType === "error") {
+                    throw new Error(data.message || "全局训练失败");
+                }
+            }
+        }
+    } catch (error) {
+        setStatus(error.message, "error");
+    } finally {
+        setBusy(false);
+        elements.globalTrainProgressWrap.classList.add("hidden");
+    }
+}
+
+async function globalInfer() {
+    if (!state.sessionId) {
+        setStatus("请先加载场景", "error");
+        return;
+    }
+    if (!state.globalModelReady) {
+        setStatus("请先训练全局模型", "error");
+        return;
+    }
+    setBusy(true, "正在使用全局模型执行推理…");
+    setInferring(true);
+    updateProgress(0, "准备中…");
+    elements.globalInferProgressWrap.classList.remove("hidden");
+    elements.globalInferProgressBar.style.width = "0%";
+    elements.globalInferProgressLabel.textContent = "准备中…";
+    try {
+        const formData = new FormData();
+        formData.append("neighborhoodSize", elements.neighborhoodSizeSelect.value || "1");
+        formData.append("confThreshold", elements.confThresholdInput.value || "0.95");
+        const selectedBands = [...elements.trainBandsSelect.selectedOptions].map(opt => opt.value);
+        for (const key of selectedBands) {
+            formData.append("trainBandPaths", key);
+        }
+        const response = await fetch(`/api/sessions/${state.sessionId}/global-infer`, {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok || !response.body) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.error || `全局推理失败：${response.status}`);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split("\n\n");
+            buffer = parts.pop();
+            for (const block of parts) {
+                let eventType = "message";
+                let dataStr = "";
+                for (const line of block.split("\n")) {
+                    if (line.startsWith("event: ")) eventType = line.slice(7).trim();
+                    else if (line.startsWith("data: ")) dataStr = line.slice(6).trim();
+                }
+                if (!dataStr) continue;
+                let data;
+                try { data = JSON.parse(dataStr); } catch { continue; }
+                if (eventType === "progress") {
+                    elements.globalInferProgressBar.style.width = `${data.pct ?? 0}%`;
+                    elements.globalInferProgressLabel.textContent = data.message || "";
+                    updateProgress(data.pct ?? 0, data.message || "");
+                    setStatus(data.message || "推理中…", "busy");
+                } else if (eventType === "result") {
+                    state.predictionMask = await readMaskFromImage(data.predictionUrl);
+                    state.predictionTifUrl = data.predictionTifUrl || null;
+                    refreshColorLookup();
+                    rebuildPredictionLayer();
+                    rebuildLabelLayer();
+                    const statsLines = [`<div><strong>全局模型推理完成</strong></div>`];
+                    if (data.predictionDistribution?.length) {
+                        const dist = data.predictionDistribution
+                            .map(item => `类别 ${item.classId}: ${formatNumber(item.count)}`)
+                            .join("，");
+                        statsLines.push(`<div><strong>推理分布：</strong>${dist}</div>`);
+                    }
+                    elements.trainStats.innerHTML = statsLines.join("");
+                    elements.copyPredictionBtn.disabled = false;
+                    setStatus(data.message || "全局推理完成", "success");
+                } else if (eventType === "error") {
+                    throw new Error(data.message || "全局推理失败");
+                }
+            }
+        }
+    } catch (error) {
+        setStatus(error.message, "error");
+    } finally {
+        setBusy(false);
+        setInferring(false);
+        elements.globalInferProgressWrap.classList.add("hidden");
     }
 }
 
@@ -1219,6 +1500,9 @@ function bindEvents() {
     elements.zoomOutBtn.addEventListener("click", () => setZoom(state.zoom - 0.1));
     elements.zoomInBtn.addEventListener("click", () => setZoom(state.zoom + 0.1));
     elements.fitViewBtn.addEventListener("click", fitView);
+    elements.saveToPoolBtn.addEventListener("click", saveToPool);
+    elements.globalTrainBtn.addEventListener("click", globalTrain);
+    elements.globalInferBtn.addEventListener("click", globalInfer);
 
     elements.labelCanvas.addEventListener("pointerdown", handlePointerDown);
     elements.labelCanvas.addEventListener("pointermove", handlePointerMove);
@@ -1292,8 +1576,11 @@ function initialize() {
     bindEvents();
     elements.copyPredictionBtn.disabled = true;
     elements.downloadLabelsBtn.disabled = true;
+    elements.saveToPoolBtn.disabled = true;
+    elements.globalInferBtn.disabled = true;
     elements.folderPathInput.value = window.APP_CONFIG.workspaceRoot || "";
     updateFolderNavUI();
+    refreshPoolStatus();
 }
 
 initialize();
